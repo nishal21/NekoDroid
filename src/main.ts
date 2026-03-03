@@ -10,6 +10,7 @@ import init, {
   get_cpu_state,
   step_cpu,
   load_demo_program,
+  load_custom_hex,
 } from '../pkg/nekodroid.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -100,6 +101,18 @@ app.innerHTML = `
         <span class="flag" id="flag-c">C</span>
         <span class="flag" id="flag-v">V</span>
         <span class="flag flag-mode" id="flag-t">ARM</span>
+      </div>
+      <div class="disasm-panel" id="disasm-panel">
+        <div class="disasm-header">DISASSEMBLY</div>
+        <div class="disasm-lines" id="disasm-lines"></div>
+      </div>
+      <div class="hex-upload-panel">
+        <div class="hex-upload-header">CUSTOM PROGRAM</div>
+        <textarea id="hex-input" class="hex-input" rows="4"
+          placeholder="Paste ARM hex: e3a00005 e3a0100a e0802001"></textarea>
+        <button id="btn-upload-hex" class="debug-btn hex-upload-btn">
+          <span class="btn-icon">⬆️</span> Upload to RAM
+        </button>
       </div>
     </div>
 
@@ -345,6 +358,14 @@ async function main() {
         flagV.classList.toggle('flag-set', state.v);
         flagT.textContent = state.t ? 'THUMB' : 'ARM';
         flagT.classList.toggle('flag-set', state.t);
+
+        // Update disassembly
+        const disasmEl = document.getElementById('disasm-lines')!;
+        if (state.disasm && state.disasm.length > 0) {
+          disasmEl.innerHTML = state.disasm.map((line: string, i: number) =>
+            `<div class="disasm-line${i === 0 ? ' disasm-current' : ''}">${line}</div>`
+          ).join('');
+        }
       } catch (_) { /* ignore parse errors during init */ }
     }
 
@@ -380,6 +401,23 @@ async function main() {
     });
 
     addLog('Debug panel active', 'success');
+
+    // ── Hex upload ──────────────────────────────────────────────────
+    document.getElementById('btn-upload-hex')!.addEventListener('click', () => {
+      const textarea = document.getElementById('hex-input') as HTMLTextAreaElement;
+      const hex = textarea.value.trim();
+      if (!hex) {
+        addLog('No hex input provided', 'system');
+        return;
+      }
+      const ok = load_custom_hex(hex);
+      if (ok) {
+        updateDebugPanel();
+        addLog('Custom program uploaded — click Step to execute', 'success');
+      } else {
+        addLog('Failed to parse hex input', 'system');
+      }
+    });
 
   } catch (err) {
     statusText.textContent = 'Failed to load Wasm module ✗';

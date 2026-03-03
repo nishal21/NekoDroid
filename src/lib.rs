@@ -191,7 +191,7 @@ pub fn init_emulator(ram_mb: u32) {
 }
 
 /// Returns the CPU state as a JSON string for the debug panel.
-/// Format: {"regs":[r0..r15],"cpsr":u32,"n":bool,"z":bool,"c":bool,"v":bool,"t":bool,"cycles":u32,"halted":bool}
+/// Includes registers, flags, and disassembly of next 5 instructions.
 #[wasm_bindgen]
 pub fn get_cpu_state() -> String {
     ARM_CPU.with(|cell| {
@@ -201,8 +201,22 @@ pub fn get_cpu_state() -> String {
                 let regs: Vec<String> = (0..16)
                     .map(|i| cpu.regs.read(i).to_string())
                     .collect();
+
+                // Disassemble the next 5 instructions from PC
+                let pc = cpu.regs.pc();
+                let disasm: Vec<String> = (0..5)
+                    .map(|i| {
+                        let addr = pc.wrapping_add(i * 4);
+                        let asm = cpu.disassemble_at(addr);
+                        // Escape quotes for JSON
+                        let escaped = asm.replace('"', "\\\"")
+                            .replace('\\', "\\\\");
+                        format!("\"0x{:08X}: {}\"", addr, escaped)
+                    })
+                    .collect();
+
                 format!(
-                    r#"{{"regs":[{}],"cpsr":{},"n":{},"z":{},"c":{},"v":{},"t":{},"cycles":{},"halted":{}}}"#,
+                    r#"{{"regs":[{}],"cpsr":{},"n":{},"z":{},"c":{},"v":{},"t":{},"cycles":{},"halted":{},"disasm":[{}]}}"#,
                     regs.join(","),
                     cpu.regs.cpsr(),
                     cpu.regs.flag_n(),
@@ -212,6 +226,7 @@ pub fn get_cpu_state() -> String {
                     cpu.regs.is_thumb(),
                     CYCLE_COUNT.load(Ordering::Relaxed),
                     cpu.halted,
+                    disasm.join(","),
                 )
             }
             None => r#"{"error":"CPU not initialized"}"#.to_string(),
@@ -293,4 +308,46 @@ pub fn send_touch_event(x: i32, y: i32, is_down: bool) {
 #[wasm_bindgen]
 pub fn send_key_event(keycode: i32) {
     log(&format!("⌨️ Key pressed: keycode={}", keycode));
+}
+
+/// Parses a hex string (e.g. "e3a00005 e3a0100a") and loads it as ARM machine code
+/// at address 0x8000. Supports space/newline separation or continuous hex.
+/// Resets the PC to 0x8000 and cycle count to 0.
+#[wasm_bindgen]
+pub fn load_custom_hex(hex_string: &str) -> bool {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(cpu) = borrow.as_mut() {
+            // Strip whitespace and parse hex
+            let clean: String = hex_string
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect();
+
+            if clean.len() % 8 != 0 {
+                log(&format!("❌ Invalid hex: {} chars (must be multiple of 8)", clean.len()));
+                return false;
+            }
+
+            let mut bytes = Vec::new();
+            for chunk in clean.as_bytes().chunks(8) {
+                let hex_str = std::str::from_utf8(chunk).unwrap_or("");
+                match u32::from_str_radix(hex_str, 16) {
+                    Ok(word) => bytes.extend_from_slice(&word.to_le_bytes()),
+                    Err(_) => {
+                        log(&format!("❌ Invalid hex word: {}", hex_str));
+                        return false;
+                    }
+                }
+            }
+
+            let instr_count = bytes.len() / 4;
+            cpu.load_program(0x8000, &bytes);
+            CYCLE_COUNT.store(0, Ordering::Relaxed);
+            log(&format!("📦 Custom program loaded at 0x8000 ({} instructions)", instr_count));
+            true
+        } else {
+            false
+        }
+    })
 }

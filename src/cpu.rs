@@ -225,6 +225,166 @@ impl Cpu {
         self.regs.set_pc(base_addr);
     }
 
+    // ── Disassembler ──────────────────────────────────────────────────
+
+    /// Register name lookup
+    fn reg_name(r: u32) -> &'static str {
+        match r {
+            0 => "R0", 1 => "R1", 2 => "R2", 3 => "R3",
+            4 => "R4", 5 => "R5", 6 => "R6", 7 => "R7",
+            8 => "R8", 9 => "R9", 10 => "R10", 11 => "R11",
+            12 => "R12", 13 => "SP", 14 => "LR", 15 => "PC",
+            _ => "??",
+        }
+    }
+
+    /// Condition suffix string
+    fn cond_suffix(cond: u32) -> &'static str {
+        match cond {
+            0x0 => "EQ", 0x1 => "NE", 0x2 => "CS", 0x3 => "CC",
+            0x4 => "MI", 0x5 => "PL", 0x6 => "VS", 0x7 => "VC",
+            0x8 => "HI", 0x9 => "LS", 0xA => "GE", 0xB => "LT",
+            0xC => "GT", 0xD => "LE", 0xE => "",   0xF => "",
+            _ => "",
+        }
+    }
+
+    /// Disassembles a single 32-bit ARM instruction into human-readable assembly.
+    pub fn disassemble_instruction(instr: u32) -> String {
+        if instr == 0 {
+            return "NOP (0x00000000)".to_string();
+        }
+
+        let cond = (instr >> 28) & 0xF;
+        let cs = Self::cond_suffix(cond);
+        let bits_27_25 = (instr >> 25) & 0b111;
+
+        match bits_27_25 {
+            // Data Processing
+            0b000 | 0b001 => {
+                let is_imm = (instr >> 25) & 1 == 1;
+                let opcode = (instr >> 21) & 0xF;
+                let s = if (instr >> 20) & 1 == 1 { "S" } else { "" };
+                let rn = (instr >> 16) & 0xF;
+                let rd = (instr >> 12) & 0xF;
+
+                let op2_str = if is_imm {
+                    let imm8 = instr & 0xFF;
+                    let rotate = ((instr >> 8) & 0xF) * 2;
+                    let val = imm8.rotate_right(rotate);
+                    format!("#{}", val)
+                } else {
+                    let rm = instr & 0xF;
+                    let shift_type = (instr >> 5) & 0x3;
+                    let shift_amount = (instr >> 7) & 0x1F;
+                    let shift_name = match shift_type {
+                        0 => "LSL", 1 => "LSR", 2 => "ASR", 3 => "ROR", _ => "??",
+                    };
+                    if shift_amount == 0 {
+                        Self::reg_name(rm).to_string()
+                    } else {
+                        format!("{}, {} #{}", Self::reg_name(rm), shift_name, shift_amount)
+                    }
+                };
+
+                let mnemonic = match opcode {
+                    0x0 => "AND", 0x1 => "EOR", 0x2 => "SUB", 0x3 => "RSB",
+                    0x4 => "ADD", 0x5 => "ADC", 0x6 => "SBC", 0x7 => "RSC",
+                    0x8 => "TST", 0x9 => "TEQ", 0xA => "CMP", 0xB => "CMN",
+                    0xC => "ORR", 0xD => "MOV", 0xE => "BIC", 0xF => "MVN",
+                    _ => "???",
+                };
+
+                match opcode {
+                    // MOV, MVN: Rd, op2 (no Rn)
+                    0xD | 0xF => format!("{}{}{} {}, {}", mnemonic, cs, s, Self::reg_name(rd), op2_str),
+                    // CMP, CMN, TST, TEQ: Rn, op2 (no Rd, always sets flags)
+                    0x8 | 0x9 | 0xA | 0xB => format!("{}{} {}, {}", mnemonic, cs, Self::reg_name(rn), op2_str),
+                    // Normal 3-operand: Rd, Rn, op2
+                    _ => format!("{}{}{} {}, {}, {}", mnemonic, cs, s, Self::reg_name(rd), Self::reg_name(rn), op2_str),
+                }
+            }
+            // LDR / STR
+            0b010 | 0b011 => {
+                let p = (instr >> 24) & 1 == 1;
+                let u = (instr >> 23) & 1 == 1;
+                let b = (instr >> 22) & 1 == 1;
+                let w = (instr >> 21) & 1 == 1;
+                let l = (instr >> 20) & 1 == 1;
+                let rn = (instr >> 16) & 0xF;
+                let rd = (instr >> 12) & 0xF;
+
+                let mnemonic = if l {
+                    if b { "LDRB" } else { "LDR" }
+                } else {
+                    if b { "STRB" } else { "STR" }
+                };
+
+                let offset = instr & 0xFFF;
+                let sign = if u { "" } else { "-" };
+                let wb = if w && p { "!" } else { "" };
+
+                if p {
+                    if offset == 0 {
+                        format!("{}{} {}, [{}]{}", mnemonic, cs, Self::reg_name(rd), Self::reg_name(rn), wb)
+                    } else {
+                        format!("{}{} {}, [{}, #{}{}]{}", mnemonic, cs, Self::reg_name(rd), Self::reg_name(rn), sign, offset, wb)
+                    }
+                } else {
+                    format!("{}{} {}, [{}], #{}{}", mnemonic, cs, Self::reg_name(rd), Self::reg_name(rn), sign, offset)
+                }
+            }
+            // LDM / STM
+            0b100 => {
+                let p = (instr >> 24) & 1 == 1;
+                let u = (instr >> 23) & 1 == 1;
+                let w = (instr >> 21) & 1 == 1;
+                let l = (instr >> 20) & 1 == 1;
+                let rn = (instr >> 16) & 0xF;
+                let reg_list = instr & 0xFFFF;
+
+                let mode = match (p, u) {
+                    (false, true) => "IA",
+                    (true, true)  => "IB",
+                    (false, false) => "DA",
+                    (true, false)  => "DB",
+                };
+
+                let mnemonic = if l { "LDM" } else { "STM" };
+                let wb = if w { "!" } else { "" };
+
+                let mut regs = Vec::new();
+                for i in 0..16u32 {
+                    if reg_list & (1 << i) != 0 {
+                        regs.push(Self::reg_name(i).to_string());
+                    }
+                }
+
+                format!("{}{}{} {}{}, {{{}}}", mnemonic, cs, mode, Self::reg_name(rn), wb, regs.join(", "))
+            }
+            // Branch
+            0b101 => {
+                let link = (instr >> 24) & 1 == 1;
+                let mnemonic = if link { "BL" } else { "B" };
+                let offset24 = instr & 0x00FF_FFFF;
+                let offset = if offset24 & 0x0080_0000 != 0 {
+                    ((offset24 | 0xFF00_0000) << 2) as i32
+                } else {
+                    (offset24 << 2) as i32
+                };
+                // Offset is relative to PC+8
+                format!("{}{} #{:+}", mnemonic, cs, offset.wrapping_add(8))
+            }
+            _ => format!("??? ({:#010X})", instr),
+        }
+    }
+
+    /// Disassembles the instruction at the given memory address.
+    pub fn disassemble_at(&self, addr: u32) -> String {
+        let instr = self.mmu.read_u32(addr);
+        Self::disassemble_instruction(instr)
+    }
+
     // ── Fetch-Decode-Execute ──────────────────────────────────────────
 
     /// Executes one instruction cycle: fetch → decode → execute.

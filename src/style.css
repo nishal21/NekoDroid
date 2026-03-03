@@ -513,3 +513,86 @@ body::before {
   background: rgba(239, 68, 68, 0.1);
   border-color: rgba(239, 68, 68, 0.3);
 }
+
+/* ── Disassembly Panel ──────────────────────────────────────────────── */
+
+.disasm-panel {
+  border-top: 1px solid var(--border);
+  padding: 0;
+}
+
+.disasm-header {
+  font-family: var(--font-mono);
+  font-size: 0.55rem;
+  color: var(--text-muted);
+  letter-spacing: 0.15em;
+  padding: 0.5rem 1rem 0.25rem;
+}
+
+.disasm-lines {
+  padding: 0 0.5rem 0.5rem;
+}
+
+.disasm-line {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  padding: 0.2rem 0.5rem;
+  border-radius: 0.25rem;
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.disasm-line.disasm-current {
+  color: #22d3ee;
+  background: rgba(34, 211, 238, 0.08);
+  border-left: 2px solid #22d3ee;
+  font-weight: 600;
+}
+
+/* ── Hex Upload Panel ───────────────────────────────────────────────── */
+
+.hex-upload-panel {
+  border-top: 1px solid var(--border);
+  padding: 0.5rem 1rem;
+}
+
+.hex-upload-header {
+  font-family: var(--font-mono);
+  font-size: 0.55rem;
+  color: var(--text-muted);
+  letter-spacing: 0.15em;
+  margin-bottom: 0.4rem;
+}
+
+.hex-input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+
+.hex-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 8px rgba(124, 58, 237, 0.15);
+}
+
+.hex-input::placeholder {
+  color: var(--text-muted);
+}
+
+.hex-upload-btn {
+  width: 100%;
+  justify-content: center;
+  margin-top: 0.4rem;
+  padding: 0.5rem !important;
+}

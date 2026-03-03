@@ -200,11 +200,35 @@
 
 ---
 
+## Session 10: ARM Disassembler & Custom Program Loader
+**Date:** 2026-03-03  
+**Role:** WebAssembly & Frontend UI Engineer
+
+### What We Built
+- **`disassemble_instruction(instr: u32) -> String`** — ARM disassembler covering:
+  - Data Processing (MOV/ADD/SUB/CMP/AND/ORR/EOR/BIC/MVN) with barrel shift notation
+  - Condition suffixes (EQ/NE/CS/CC/MI/PL etc.)
+  - LDR/STR with offset/pre-index/post-index/writeback notation
+  - LDM/STM with register list formatting
+  - B/BL with signed offset
+- **`get_cpu_state()`** now includes `disasm[]` — next 5 instructions from PC
+- **`load_custom_hex(hex_string)`** — parses hex, writes to 0x8000, resets PC
+- **Disassembly panel** — shows next 5 instructions, current PC highlighted cyan
+- **Custom Program panel** — textarea for pasting hex + "Upload to RAM" button
+
+### Verified
+- Load Demo → Step: `0x00008004: MOV R1, #10` highlighted ✅
+- Disassembly shows `ADD R2, R0, R1` / `SUB R3, R2, #1` / `CMP R3, #14` / `BEQ #+8` ✅
+- Hex upload textarea + Upload to RAM button visible ✅
+
+---
+
 ## What's Next (Phase 3)
-- [ ] Register-shifted register offsets (shift amount from Rs)
-- [ ] Custom program loader (paste hex / upload binary)
-- [ ] Disassembly view in debug panel
 - [ ] MUL / MLA (multiply instructions)
+- [ ] BX (Branch Exchange for Thumb interworking)
+- [ ] SWI (Software Interrupt for syscall emulation)
+- [ ] Memory-mapped I/O stubs
+
 
 
 
