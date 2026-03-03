@@ -106,9 +106,37 @@
 
 ---
 
+## Session 6: ARM Instruction Execution Loop
+**Date:** 2026-03-03  
+**Role:** Systems Programmer / ARM Emulator Architect
+
+### What We Built
+- **`step(&mut self)`** — full fetch-decode-execute cycle: reads instruction at PC, advances PC by 4, checks condition code, decodes format, executes
+- **Condition code evaluator** — all 15 ARM conditions (EQ, NE, CS, CC, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE, AL) checked against CPSR N/Z/C/V flags
+- **Data Processing decode** — bitmask decode of opcode bits [24:21], immediate vs register operand2 with rotation
+- **ALU operations:** MOV, ADD, SUB, AND, EOR, ORR, CMP, BIC, MVN — with optional S flag for N/Z/C/V updates
+- **Branch (B/BL)** — sign-extended 24-bit offset, left-shifted by 2, added to PC+8 (ARM pipeline adjustment). BL saves return address to LR.
+
+### Tests (21 total, all pass in 0.01s)
+- `test_basic_alu` — MOV R0, #5 → ADD R1, R0, #10 → R1 == 15 ✅
+- `test_mov_register` — MOV R0, #42 → MOV R1, R0 → R1 == 42 ✅
+- `test_sub_instruction` — MOV R0, #20 → SUB R1, R0, #5 → R1 == 15 ✅
+- `test_cmp_sets_flags` — CMP R0, #5 → Z flag set ✅
+- `test_branch_forward` — B skips one instruction ✅
+- `test_branch_backward` — B loops back, R0 increments ✅
+- `test_conditional_execution` — MOVEQ executes, MOVNE skipped ✅
+
+### Key Design Decisions
+- **ARM pipeline offset:** Branch target = `PC_at_fetch + 8 + (sign_extended_offset << 2)`. The +8 accounts for the 3-stage ARM pipeline where PC reads as current instruction + 8.
+- **Unimplemented instructions:** In test builds, `panic!` to catch issues. In release/Wasm, silently skip to avoid crashing the browser.
+- **Carry/Overflow flags:** Properly computed for ADD (carry out) and SUB/CMP (borrow).
+
+---
+
 ## What's Next (Phase 1: Instruction Decoding)
-- [ ] ARM instruction decoder (condition codes, data processing, branch, load/store)
-- [ ] Basic ALU execution (ADD, SUB, MOV, CMP, AND, ORR, EOR)
-- [ ] Branch instruction execution (B, BL, BX)
-- [ ] Load/Store execution (LDR, STR)
-- [ ] Test with hand-assembled ARM binary snippets
+- [ ] Load/Store (LDR, STR) execution
+- [ ] Register shift operands (LSL, LSR, ASR, ROR)
+- [ ] BL (Branch with Link) testing
+- [ ] Load/Store Multiple (LDM, STM)
+- [ ] Test with longer ARM programs
+
