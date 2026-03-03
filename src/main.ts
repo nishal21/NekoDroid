@@ -86,6 +86,9 @@ app.innerHTML = `
           <button id="btn-load-demo" class="debug-btn">
             <span class="btn-icon">📦</span> Load Demo
           </button>
+          <button id="btn-load-uart" class="debug-btn" style="background: linear-gradient(135deg, #1a5a2a, #2d8a4e); border-color: #3dbb6e;">
+            <span class="btn-icon">📟</span> Hello UART
+          </button>
           <button id="btn-step" class="debug-btn">
             <span class="btn-icon">⏭️</span> Step
           </button>
@@ -378,6 +381,43 @@ async function main() {
       load_demo_program();
       updateDebugPanel();
       addLog('Demo program loaded — click Step to execute', 'success');
+    });
+
+    // ── Hello UART Demo ─────────────────────────────────────────────────
+    // Hand-assembled ARM program:
+    //   0x8000: MOV R1, #0x10000000    ; UART TX base
+    //   0x8004: ADD R2, PC, #0x18      ; R2 → string at 0x8020 (PC+4+0x18)
+    //   0x8008: LDRB R0, [R2], #1      ; loop: load byte, post-increment
+    //   0x800C: CMP R0, #0             ; null terminator?
+    //   0x8010: BEQ halt (0x801C)      ; if null → halt
+    //   0x8014: STRB R0, [R1]          ; write byte to UART TX
+    //   0x8018: B loop (0x8008)         ; next byte
+    //   0x801C: B . (halt)             ; infinite loop
+    //   0x8020: "Hello World!\n\0"     ; ASCII data (padded to 4-byte boundary)
+    const HELLO_UART_HEX = [
+      'E3A01201',  // MOV R1, #0x10000000
+      'E28F2018',  // ADD R2, PC, #0x18 (points to 0x8020)
+      'E4D20001',  // LDRB R0, [R2], #1
+      'E3500000',  // CMP R0, #0
+      '0A000001',  // BEQ +2 (to 0x801C)
+      'E5C10000',  // STRB R0, [R1]
+      'EAFFFFFA',  // B -6 (to 0x8008)
+      'EAFFFFFE',  // B . (halt)
+      '6C6C6548',  // "Hell" (LE)
+      '6F57206F',  // "o Wo" (LE)
+      '21646C72',  // "rld!" (LE)
+      '0000000A',  // "\n\0\0\0" (LE)
+    ].join(' ');
+
+    document.getElementById('btn-load-uart')!.addEventListener('click', () => {
+      const ok = load_custom_hex(HELLO_UART_HEX);
+      if (ok) {
+        updateDebugPanel();
+        addLog('🐱 Hello UART demo loaded at 0x8000 — press Run 10 to see it print!', 'success');
+        addLog('Program writes "Hello World!" to UART TX (0x10000000)', 'info');
+      } else {
+        addLog('Failed to load UART demo', 'system');
+      }
     });
 
     document.getElementById('btn-step')!.addEventListener('click', () => {

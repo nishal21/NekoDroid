@@ -334,9 +334,31 @@
 
 ---
 
+## Session 16: Hello UART Demo (First Program!)
+**Date:** 2026-03-03  
+**Role:** WebAssembly & Frontend UI Engineer
+
+### What We Built
+- **Hand-assembled ARM program** that writes "Hello World!\n" to the virtual UART:
+  - `MOV R1, #0x10000000` (UART TX address)
+  - `ADD R2, PC, #0x18` (PC-relative load of string at 0x8020)
+  - LDRB/CMP/BEQ/STRB/B loop to write each byte to UART TX
+  - `B .` halt when null terminator reached
+  - String data "Hello World!\n\0" at 0x8020
+- **"Hello UART" button** in the debug panel UI (green, distinct from Load Demo)
+- **Bug fix:** PC-relative offset adjusted from `#0x14` to `#0x18` because our emulator reads PC as `instruction_addr + 4` during ALU execution (not `+8` like real ARM hardware)
+
+### Verification
+- Console output: `📟 UART: Hello World!` — clean, no garbage characters ✅
+- CPU halts at `0x801C` with `B #+0` infinite loop ✅
+- R2 ends at `0x802E` (past the string) ✅
+
+---
+
 ## What's Next (Phase 5)
-- [ ] UART-based "Hello World" demo program in ARM assembly
 - [ ] Multi-file structured tests
+- [ ] Thumb instruction set (16-bit)
+
 
 
 
