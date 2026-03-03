@@ -262,6 +262,28 @@ impl Cpu {
         match bits_27_25 {
             // Data Processing
             0b000 | 0b001 => {
+                // Check for Multiply: bits [7:4] = 1001, bits [27:22] = 000000 or 000001
+                if bits_27_25 == 0b000 && (instr & 0x0FC0_00F0) == 0x0000_0090 {
+                    let a = (instr >> 21) & 1 == 1;
+                    let rd = (instr >> 16) & 0xF;
+                    let rn = (instr >> 12) & 0xF;
+                    let rs = (instr >> 8) & 0xF;
+                    let rm = instr & 0xF;
+                    if a {
+                        return format!("MLA{} {}, {}, {}, {}", cs,
+                            Self::reg_name(rd), Self::reg_name(rm),
+                            Self::reg_name(rs), Self::reg_name(rn));
+                    } else {
+                        return format!("MUL{} {}, {}, {}", cs,
+                            Self::reg_name(rd), Self::reg_name(rm),
+                            Self::reg_name(rs));
+                    }
+                }
+                // Check for BX
+                if bits_27_25 == 0b000 && (instr & 0x0FFF_FFF0) == 0x012F_FF10 {
+                    let rm = instr & 0xF;
+                    return format!("BX{} {}", cs, Self::reg_name(rm));
+                }
                 let is_imm = (instr >> 25) & 1 == 1;
                 let opcode = (instr >> 21) & 0xF;
                 let s = if (instr >> 20) & 1 == 1 { "S" } else { "" };
@@ -412,7 +434,19 @@ impl Cpu {
 
         match bits_27_25 {
             // 000 = Data Processing (register) / Multiply / Misc
-            0b000 => self.execute_data_processing(instr),
+            0b000 => {
+                // Check for Multiply: bits [7:4] = 1001 and bits [27:22] = 000000 or 000001
+                if (instr & 0x0FC0_00F0) == 0x0000_0090 {
+                    self.execute_multiply(instr);
+                }
+                // Check for BX: bits [27:4] = 0x012FFF1
+                else if (instr & 0x0FFF_FFF0) == 0x012F_FF10 {
+                    self.execute_branch_exchange(instr);
+                }
+                else {
+                    self.execute_data_processing(instr);
+                }
+            }
             // 001 = Data Processing (immediate)
             0b001 => self.execute_data_processing(instr),
             // 010 = Load/Store (immediate offset)
@@ -641,6 +675,64 @@ impl Cpu {
         }
 
         self.regs.set_pc(target);
+    }
+
+    // ── Multiply (MUL / MLA) ─────────────────────────────────────────
+
+    /// Decodes and executes a Multiply (MUL) or Multiply-Accumulate (MLA).
+    ///
+    /// ARM encoding:  cond | 000000 | A | S | Rd | Rn | Rs | 1001 | Rm
+    ///   A (bit 21): 0 = MUL, 1 = MLA (add Rn)
+    ///   S (bit 20): 1 = update CPSR flags
+    ///   Rd [19:16]: destination register
+    ///   Rn [15:12]: accumulate register (MLA only)
+    ///   Rs [11:8]:  multiplier register
+    ///   Rm [3:0]:   multiplicand register
+    fn execute_multiply(&mut self, instr: u32) {
+        let accumulate = (instr >> 21) & 1 == 1;
+        let set_flags  = (instr >> 20) & 1 == 1;
+        let rd = ((instr >> 16) & 0xF) as usize;
+        let rn = ((instr >> 12) & 0xF) as usize;
+        let rs = ((instr >> 8) & 0xF) as usize;
+        let rm = (instr & 0xF) as usize;
+
+        let rm_val = self.regs.read(rm);
+        let rs_val = self.regs.read(rs);
+
+        let result = if accumulate {
+            let rn_val = self.regs.read(rn);
+            rm_val.wrapping_mul(rs_val).wrapping_add(rn_val) // MLA: Rd = Rm * Rs + Rn
+        } else {
+            rm_val.wrapping_mul(rs_val) // MUL: Rd = Rm * Rs
+        };
+
+        self.regs.write(rd, result);
+        if set_flags {
+            self.regs.update_nz(result);
+        }
+    }
+
+    // ── Branch Exchange (BX) ────────────────────────────────────────
+
+    /// Executes a Branch Exchange (BX) instruction.
+    ///
+    /// ARM encoding:  cond | 0001 0010 1111 1111 1111 0001 | Rm
+    ///   Rm [3:0]: register containing target address
+    ///   If bit 0 of Rm is 1 → switch to Thumb mode, clear LSB
+    ///   If bit 0 of Rm is 0 → stay in ARM mode
+    fn execute_branch_exchange(&mut self, instr: u32) {
+        let rm = (instr & 0xF) as usize;
+        let target = self.regs.read(rm);
+
+        if target & 1 != 0 {
+            // Switch to Thumb mode: set T flag, clear LSB
+            self.regs.set_thumb(true);
+            self.regs.set_pc(target & !1);
+        } else {
+            // Stay in ARM mode: clear T flag
+            self.regs.set_thumb(false);
+            self.regs.set_pc(target);
+        }
     }
 
     // ── Single Data Transfer (LDR / STR) ───────────────────────────────
@@ -1277,6 +1369,87 @@ mod tests {
         assert_eq!(cpu.regs.read(7), 30);
         // R8 gets value from addr 0x20C (was R3 = 40)
         assert_eq!(cpu.regs.read(8), 40);
+    }
+
+    // ── Multiply tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_mul() {
+        // MUL R0, R1, R2  (R0 = R1 * R2 = 5 * 6 = 30)
+        // ARM encoding: cond | 000000 | A=0 | S=0 | Rd | 0000 | Rs | 1001 | Rm
+        //   Rd=R0, Rs=R2, Rm=R1
+        //   = 0xE0000291
+        let program: Vec<u8> = [
+            0xE3A01005u32.to_le_bytes(), // MOV R1, #5
+            0xE3A02006u32.to_le_bytes(), // MOV R2, #6
+            0xE0000291u32.to_le_bytes(), // MUL R0, R1, R2
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R1, #5
+        cpu.step(); // MOV R2, #6
+        cpu.step(); // MUL R0, R1, R2
+        assert_eq!(cpu.regs.read(0), 30, "5 * 6 = 30");
+    }
+
+    #[test]
+    fn test_mla() {
+        // MLA R0, R1, R2, R3  (R0 = R1 * R2 + R3 = 5 * 6 + 10 = 40)
+        // ARM encoding: cond | 000000 | A=1 | S=0 | Rd | Rn | Rs | 1001 | Rm
+        //   Rd=R0, Rn=R3, Rs=R2, Rm=R1
+        //   = 0xE0203291
+        let program: Vec<u8> = [
+            0xE3A01005u32.to_le_bytes(), // MOV R1, #5
+            0xE3A02006u32.to_le_bytes(), // MOV R2, #6
+            0xE3A0300Au32.to_le_bytes(), // MOV R3, #10
+            0xE0203291u32.to_le_bytes(), // MLA R0, R1, R2, R3
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R1, #5
+        cpu.step(); // MOV R2, #6
+        cpu.step(); // MOV R3, #10
+        cpu.step(); // MLA R0, R1, R2, R3
+        assert_eq!(cpu.regs.read(0), 40, "5 * 6 + 10 = 40");
+    }
+
+    // ── BX tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_bx_to_thumb() {
+        // Set R0 = 0x101 (LSB set → switch to Thumb)
+        // BX R0 → PC = 0x100, T flag set
+        // BX R0 = 0xE12FFF10
+        let program: Vec<u8> = [
+            0xE3A00F40u32.to_le_bytes(), // MOV R0, #256 (0x100)
+            0xE2800001u32.to_le_bytes(), // ADD R0, R0, #1  → R0 = 0x101
+            0xE12FFF10u32.to_le_bytes(), // BX R0
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #256
+        cpu.step(); // ADD R0, R0, #1 → R0 = 0x101
+        cpu.step(); // BX R0
+
+        assert_eq!(cpu.regs.pc(), 0x100, "PC should be 0x100 (LSB cleared)");
+        assert!(cpu.regs.is_thumb(), "T flag should be set (switched to Thumb mode)");
+    }
+
+    #[test]
+    fn test_bx_stay_arm() {
+        // Set R0 = 0x100 (LSB clear → stay ARM)
+        // BX R0 → PC = 0x100, T flag clear
+        let program: Vec<u8> = [
+            0xE3A00F40u32.to_le_bytes(), // MOV R0, #256 (0x100)
+            0xE12FFF10u32.to_le_bytes(), // BX R0
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #256
+        cpu.step(); // BX R0
+
+        assert_eq!(cpu.regs.pc(), 0x100, "PC should be 0x100");
+        assert!(!cpu.regs.is_thumb(), "T flag should be clear (staying ARM)");
     }
 }
 

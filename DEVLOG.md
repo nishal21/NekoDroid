@@ -223,11 +223,34 @@
 
 ---
 
+## Session 11: Multiply (MUL/MLA) & Branch Exchange (BX)
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **`execute_multiply()`** — MUL (Rd = Rm * Rs) and MLA (Rd = Rm * Rs + Rn)
+  - Correct register encoding: Rd [19:16], Rn [15:12], Rs [11:8], Rm [3:0]
+  - Optional S flag for CPSR N/Z updates
+- **`execute_branch_exchange()`** — BX Rm with Thumb interworking
+  - LSB = 1 → set T flag in CPSR, clear LSB, switch to Thumb
+  - LSB = 0 → clear T flag, stay in ARM mode
+- Dispatch detection: MUL/MLA identified by bits [7:4]=1001, BX by 0x012FFF1x
+- Disassembler updated for MUL, MLA, BX
+
+### Tests (33 total, all pass)
+- `test_mul` — 5 * 6 = 30 ✅
+- `test_mla` — 5 * 6 + 10 = 40 ✅
+- `test_bx_to_thumb` — R0 = 0x101 → PC = 0x100, T flag set ✅
+- `test_bx_stay_arm` — R0 = 0x100 → PC = 0x100, T flag clear ✅
+
+---
+
 ## What's Next (Phase 3)
-- [ ] MUL / MLA (multiply instructions)
-- [ ] BX (Branch Exchange for Thumb interworking)
 - [ ] SWI (Software Interrupt for syscall emulation)
 - [ ] Memory-mapped I/O stubs
+- [ ] BLX (Branch with Link and Exchange)
+- [ ] Halfword load/store (LDRH, STRH)
+
 
 
 
