@@ -288,9 +288,31 @@
 
 ---
 
+## Session 14: BLX and Halfword Load/Stores
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **BLX (Register)**: Branch with Link and Exchange.
+  - Implemented `execute_blx_register()`
+  - Saves return address (current PC + 4) into Link Register (R14).
+  - Uses LSB of target address to correctly switch between ARM and Thumb modes.
+- **Halfword/Signed Data Transfers**:
+  - Implemented `execute_halfword_transfer()`
+  - Added support for **STRH**, **LDRH** (zero-extended), **LDRSB** (sign-extended to 32 bits), and **LDRSH** (sign-extended to 32 bits).
+  - Handles immediate and register offsets, pre/post-indexing, up/down, and write-back.
+- **Disassembler**: Added string formatting for `BLX Rm` and all four extra load/stores with their respective addressing modes.
+
+### Tests (44 total, all pass)
+- `test_blx_register` — Validates branch to PC, T flag update, and LR save. ✅
+- `test_strh_stores_halfword` — Validates only lower 16-bits are written. ✅
+- `test_ldrh_zero_extends` — Validates unsigned 16-bit load. ✅
+- `test_ldrsh_sign_extends` — Validates sign extension of 16-bit loaded value. ✅
+- `test_ldrsb_sign_extends` — Validates sign extension of 8-bit loaded value. ✅
+
+---
+
 ## What's Next (Phase 4)
-- [ ] BLX (Branch with Link and Exchange)
-- [ ] Halfword load/store (LDRH, STRH)
 - [ ] UART-based "Hello World" demo program
 - [ ] Basic syscall handler at vector 0x08
 

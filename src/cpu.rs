@@ -324,10 +324,50 @@ impl Cpu {
                             Self::reg_name(rs));
                     }
                 }
+                // Check for BLX (register)
+                if bits_27_25 == 0b000 && (instr & 0x0FFF_FFF0) == 0x012F_FF30 {
+                    let rm = instr & 0xF;
+                    return format!("BLX{} {}", cs, Self::reg_name(rm));
+                }
                 // Check for BX
                 if bits_27_25 == 0b000 && (instr & 0x0FFF_FFF0) == 0x012F_FF10 {
                     let rm = instr & 0xF;
                     return format!("BX{} {}", cs, Self::reg_name(rm));
+                }
+                // Check for halfword/signed transfers
+                if bits_27_25 == 0b000 && (instr & 0x90) == 0x90 && (instr & 0x0E000000) == 0
+                    && (instr & 0x0FC000F0) != 0x00000090 {
+                    let pre   = (instr >> 24) & 1 == 1;
+                    let up    = (instr >> 23) & 1 == 1;
+                    let load  = (instr >> 20) & 1 == 1;
+                    let s_bit = (instr >> 6) & 1 == 1;
+                    let h_bit = (instr >> 5) & 1 == 1;
+                    let rn = (instr >> 16) & 0xF;
+                    let rd = (instr >> 12) & 0xF;
+                    let mnemonic = if !load {
+                        "STRH"
+                    } else if s_bit && h_bit {
+                        "LDRSH"
+                    } else if s_bit {
+                        "LDRSB"
+                    } else {
+                        "LDRH"
+                    };
+                    let sign = if up { "+" } else { "-" };
+                    let imm = (instr >> 22) & 1 == 1;
+                    let off_str = if imm {
+                        let off = ((instr >> 8) & 0xF) << 4 | (instr & 0xF);
+                        format!("#{}0x{:X}", sign, off)
+                    } else {
+                        let rm = instr & 0xF;
+                        format!("{}{}", sign, Self::reg_name(rm))
+                    };
+                    let addr_str = if pre {
+                        format!("[{}, {}]", Self::reg_name(rn), off_str)
+                    } else {
+                        format!("[{}], {}", Self::reg_name(rn), off_str)
+                    };
+                    return format!("{}{} {}, {}", mnemonic, cs, Self::reg_name(rd), addr_str);
                 }
                 let is_imm = (instr >> 25) & 1 == 1;
                 let opcode = (instr >> 21) & 0xF;
@@ -493,9 +533,18 @@ impl Cpu {
                 if (instr & 0x0FC0_00F0) == 0x0000_0090 {
                     self.execute_multiply(instr);
                 }
+                // Check for BLX (register): bits [27:4] = 0x012FFF3
+                else if (instr & 0x0FFF_FFF0) == 0x012F_FF30 {
+                    self.execute_blx_register(instr, pc_at_fetch);
+                }
                 // Check for BX: bits [27:4] = 0x012FFF1
                 else if (instr & 0x0FFF_FFF0) == 0x012F_FF10 {
                     self.execute_branch_exchange(instr);
+                }
+                // Check for Halfword/Signed transfers: bit[7]=1, bit[4]=1 (not multiply)
+                else if (instr & 0x90) == 0x90 && (instr & 0x0E000000) == 0 {
+                    // Extra load/stores: LDRH, STRH, LDRSB, LDRSH
+                    self.execute_halfword_transfer(instr);
                 }
                 else {
                     self.execute_data_processing(instr);
@@ -796,51 +845,121 @@ impl Cpu {
         }
     }
 
+    // ── Branch with Link and Exchange (BLX register) ─────────────────
+
+    /// Executes BLX (register) — Branch with Link and Exchange.
+    ///
+    /// ARM encoding:  cond | 0001 0010 1111 1111 1111 0011 | Rm
+    ///   Same as BX but saves return address in LR first.
+    fn execute_blx_register(&mut self, instr: u32, pc_at_fetch: u32) {
+        let rm = (instr & 0xF) as usize;
+        let target = self.regs.read(rm);
+
+        // Save return address in LR (next instruction after this one)
+        self.regs.set_lr(pc_at_fetch.wrapping_add(4));
+
+        // Branch with exchange (same as BX)
+        if target & 1 != 0 {
+            self.regs.set_thumb(true);
+            self.regs.set_pc(target & !1);
+        } else {
+            self.regs.set_thumb(false);
+            self.regs.set_pc(target);
+        }
+    }
+
+    // ── Halfword / Signed Byte Transfers ──────────────────────────────
+
+    /// Decodes and executes LDRH, STRH, LDRSB, LDRSH.
+    ///
+    /// ARM encoding:  cond | 000 | P | U | I | W | L | Rn | Rd | offset_hi | 1 | S | H | 1 | offset_lo/Rm
+    ///   P (bit 24): pre/post indexing
+    ///   U (bit 23): up/down (add/subtract offset)
+    ///   I (bit 22): 1 = immediate offset (hi:lo), 0 = register offset (Rm)
+    ///   W (bit 21): write-back
+    ///   L (bit 20): load/store
+    ///   S (bit 6): signed
+    ///   H (bit 5): halfword (1) or byte (0, only when S=1)
+    fn execute_halfword_transfer(&mut self, instr: u32) {
+        let pre_index  = (instr >> 24) & 1 == 1;
+        let up         = (instr >> 23) & 1 == 1;
+        let imm_offset = (instr >> 22) & 1 == 1;
+        let write_back = (instr >> 21) & 1 == 1;
+        let load       = (instr >> 20) & 1 == 1;
+        let is_signed  = (instr >> 6) & 1 == 1;
+        let is_half    = (instr >> 5) & 1 == 1;
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let rd = ((instr >> 12) & 0xF) as usize;
+
+        let base = self.regs.read(rn);
+
+        // Calculate offset
+        let offset = if imm_offset {
+            // Immediate: [11:8] | [3:0]
+            let hi = (instr >> 8) & 0xF;
+            let lo = instr & 0xF;
+            (hi << 4) | lo
+        } else {
+            // Register: Rm in [3:0]
+            let rm = (instr & 0xF) as usize;
+            self.regs.read(rm)
+        };
+
+        let addr_offset = if up {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+
+        let addr = if pre_index { addr_offset } else { base };
+
+        if load {
+            let val = if is_signed && is_half {
+                // LDRSH: load signed halfword, sign-extend to 32 bits
+                let hw = self.mmu.read_u16(addr);
+                hw as i16 as i32 as u32
+            } else if is_signed && !is_half {
+                // LDRSB: load signed byte, sign-extend to 32 bits
+                let b = self.mmu.read_u8(addr);
+                b as i8 as i32 as u32
+            } else {
+                // LDRH: load unsigned halfword, zero-extend
+                self.mmu.read_u16(addr) as u32
+            };
+            self.regs.write(rd, val);
+        } else {
+            // STRH: store halfword
+            let val = self.regs.read(rd);
+            self.mmu.write_u16(addr, val as u16);
+        }
+
+        // Write-back or post-index
+        if write_back || !pre_index {
+            self.regs.write(rn, addr_offset);
+        }
+    }
+
     // ── Software Interrupt (SWI / SVC) ────────────────────────────────
 
     /// Executes a Software Interrupt (SWI / SVC) instruction.
-    ///
-    /// ARM encoding:  cond | 1111 | imm24
-    ///   imm24 [23:0]: syscall number
-    ///
-    /// Exception handling:
-    ///   1. Save current CPSR → SPSR_svc
-    ///   2. Save address of next instruction → LR (return address)
-    ///   3. Set CPU mode to Supervisor (0x13)
-    ///   4. Disable IRQ interrupts
-    ///   5. Force ARM mode (clear T flag)
-    ///   6. Set PC to SWI vector address (0x00000008)
     fn execute_swi(&mut self, instr: u32, pc_at_fetch: u32) {
         let syscall_num = instr & 0x00FF_FFFF;
 
-        // Debug log (via wasm_bindgen in non-test builds)
         #[cfg(not(test))]
         {
             crate::log(&format!("\u{1F6A8} SWI executed: Syscall number 0x{:06X}", syscall_num));
         }
         #[cfg(test)]
         {
-            let _ = syscall_num; // suppress unused warning in test
+            let _ = syscall_num;
         }
 
-        // 1. Save current CPSR into SPSR_svc
         let saved_cpsr = self.regs.cpsr();
         self.regs.set_spsr_svc(saved_cpsr);
-
-        // 2. Save return address (next instruction after SWI) into LR
-        //    PC was already advanced by advance_pc(), so pc_at_fetch + 4 = next instr
         self.regs.set_lr(pc_at_fetch.wrapping_add(4));
-
-        // 3. Switch to Supervisor mode
         self.regs.set_cpu_mode(MODE_SVC);
-
-        // 4. Disable IRQ interrupts
         self.regs.set_irq_disabled(true);
-
-        // 5. Force ARM mode (clear Thumb flag)
         self.regs.set_thumb(false);
-
-        // 6. Jump to SWI vector
         self.regs.set_pc(SWI_VECTOR);
     }
 
@@ -1618,6 +1737,90 @@ mod tests {
         // Current CPSR should be different (SVC mode, IRQ disabled)
         assert_ne!(cpu.regs.cpsr(), cpsr_before, "Current CPSR should differ after SWI");
         assert_eq!(cpu.regs.cpu_mode(), 0x13, "Now in SVC mode");
+    }
+
+    // ── BLX tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_blx_register() {
+        // BLX R0: branch to R0, save return addr in LR, switch mode if LSB=1
+        // BLX R0 = 0xE12FFF30
+        let program: Vec<u8> = [
+            0xE3A00F40u32.to_le_bytes(), // MOV R0, #256 (0x100)
+            0xE2800001u32.to_le_bytes(), // ADD R0, R0, #1 → R0 = 0x101
+            0xE12FFF30u32.to_le_bytes(), // BLX R0
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #256
+        cpu.step(); // ADD R0, R0, #1 → R0 = 0x101
+
+        let pc_before_blx = cpu.regs.pc(); // PC = 0x08 (addr of BLX = 0x08, after advance)
+        cpu.step(); // BLX R0
+
+        // PC should jump to 0x100 (LSB cleared)
+        assert_eq!(cpu.regs.pc(), 0x100, "PC should be 0x100");
+        // T flag should be set (Thumb mode, because R0 had LSB=1)
+        assert!(cpu.regs.is_thumb(), "T flag should be set");
+        // LR should contain the return address (next instruction after BLX)
+        // BLX was at addr 0x08, so return = 0x08 + 4 = 0x0C
+        assert_eq!(cpu.regs.lr(), pc_before_blx.wrapping_add(4), "LR should be return address");
+    }
+
+    // ── Halfword transfer tests ─────────────────────────────────────
+
+    #[test]
+    fn test_strh_stores_halfword() {
+        // STRH R0, [R1, #0]  (0xE1C100B0)
+        let program: Vec<u8> = [0xE1C100B0u32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.write(0, 0xBEEF); // value to store
+        cpu.regs.write(1, 0x200);  // base address
+        
+        cpu.step(); // Execute STRH
+
+        assert_eq!(cpu.mmu.read_u16(0x200), 0xBEEF, "Halfword should be stored");
+        assert_eq!(cpu.mmu.read_u8(0x202), 0, "Byte at +2 should be zero");
+    }
+
+    #[test]
+    fn test_ldrsh_sign_extends() {
+        // LDRSH R2, [R1, #0] (0xE1D120F0)
+        let program: Vec<u8> = [0xE1D120F0u32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.write(1, 0x200); // base address
+        cpu.mmu.write_u16(0x200, 0xFF80); // pre-load 0xFF80 (-128)
+
+        cpu.step(); // Execute LDRSH
+
+        // 0xFF80 as i16 = -128, sign-extended to 32 bits = 0xFFFFFF80
+        assert_eq!(cpu.regs.read(2), 0xFFFF_FF80, "LDRSH should sign-extend 0xFF80 to 0xFFFFFF80");
+    }
+
+    #[test]
+    fn test_ldrh_zero_extends() {
+        // LDRH R2, [R1, #0] (0xE1D120B0)
+        let program: Vec<u8> = [0xE1D120B0u32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.write(1, 0x200); // base address
+        cpu.mmu.write_u16(0x200, 0xFF80); // pre-load
+
+        cpu.step(); // Execute LDRH
+
+        assert_eq!(cpu.regs.read(2), 0x0000_FF80, "LDRH should zero-extend 0xFF80");
+    }
+
+    #[test]
+    fn test_ldrsb_sign_extends() {
+        // LDRSB R2, [R1, #0] (0xE1D120D0)
+        let program: Vec<u8> = [0xE1D120D0u32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.write(1, 0x200); // base address
+        cpu.mmu.write_u8(0x200, 0x80); // pre-load unsigned 0x80 (-128)
+
+        cpu.step(); // Execute LDRSB
+
+        assert_eq!(cpu.regs.read(2), 0xFFFF_FF80, "LDRSB should sign-extend 0x80 to 0xFFFFFF80");
     }
 }
 
