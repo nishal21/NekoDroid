@@ -245,11 +245,35 @@
 
 ---
 
-## What's Next (Phase 3)
-- [ ] SWI (Software Interrupt for syscall emulation)
-- [ ] Memory-mapped I/O stubs
+## Session 12: Software Interrupt (SWI / SVC)
+**Date:** 2026-03-03  
+**Role:** Systems Programmer / OS Architect
+
+### What We Built
+- **CPSR mode infrastructure** — mode bits [4:0], IRQ disable (bit 7), mode constants (User=0x10, SVC=0x13)
+- **SPSR_svc** — Saved Program Status Register for Supervisor mode exceptions
+- **`execute_swi()`** — full ARM exception handling:
+  1. Save CPSR → SPSR_svc (preserves original flags + mode)
+  2. Save next instruction address → LR (return address)
+  3. Switch to Supervisor mode (0x13)
+  4. Disable IRQ interrupts
+  5. Force ARM mode (clear T flag)
+  6. Jump to SWI vector (0x00000008)
+- **Debug log** — `🚨 SWI executed: Syscall number 0xNNNNNN` in browser console
+- **Disassembler** — `SWI #0x000042` formatting
+
+### Tests (35 total, all pass)
+- `test_swi_exception` — mode=SVC, LR=return addr, IRQ disabled, PC=0x08 ✅
+- `test_swi_preserves_spsr` — SPSR_svc saves pre-SWI CPSR with Z flag ✅
+
+---
+
+## What's Next (Phase 4)
 - [ ] BLX (Branch with Link and Exchange)
 - [ ] Halfword load/store (LDRH, STRH)
+- [ ] Memory-mapped I/O stubs
+- [ ] Basic syscall handler at vector 0x08
+
 
 
 

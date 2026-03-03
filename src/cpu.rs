@@ -11,8 +11,19 @@ const CPSR_N: u32 = 1 << 31; // Negative
 const CPSR_Z: u32 = 1 << 30; // Zero
 const CPSR_C: u32 = 1 << 29; // Carry
 const CPSR_V: u32 = 1 << 28; // Overflow
+// Bit 7: IRQ disable
+const CPSR_I: u32 = 1 << 7;  // IRQ disabled
 // Bit 5: Thumb state
 const CPSR_T: u32 = 1 << 5;  // Thumb mode (0 = ARM, 1 = Thumb)
+// Bits [4:0]: CPU mode
+const CPSR_MODE_MASK: u32 = 0x1F;
+
+// ARM CPU modes
+const MODE_USER: u32 = 0x10;  // User mode
+const MODE_SVC:  u32 = 0x13;  // Supervisor mode (SWI handler)
+
+// Exception vector addresses
+const SWI_VECTOR: u32 = 0x0000_0008;
 
 // ── Register aliases ──────────────────────────────────────────────────
 pub const REG_SP: usize = 13; // Stack Pointer
@@ -32,6 +43,8 @@ pub struct RegisterFile {
     regs: [u32; 16],
     /// Current Program Status Register
     cpsr: u32,
+    /// Saved Program Status Register (Supervisor mode)
+    spsr_svc: u32,
 }
 
 impl RegisterFile {
@@ -39,7 +52,8 @@ impl RegisterFile {
     pub fn new() -> Self {
         RegisterFile {
             regs: [0u32; 16],
-            cpsr: 0,
+            cpsr: MODE_USER, // Start in User mode
+            spsr_svc: 0,
         }
     }
 
@@ -154,10 +168,41 @@ impl RegisterFile {
     }
 
     /// Updates N and Z flags based on a 32-bit result.
-    /// This is the common update performed after most ALU operations.
     pub fn update_nz(&mut self, result: u32) {
         self.set_flag_n(result & 0x8000_0000 != 0);
         self.set_flag_z(result == 0);
+    }
+
+    // ── CPU mode ──────────────────────────────────────────────────────
+
+    /// Returns the CPU mode (bits [4:0] of CPSR).
+    pub fn cpu_mode(&self) -> u32 {
+        self.cpsr & CPSR_MODE_MASK
+    }
+
+    /// Sets the CPU mode (bits [4:0] of CPSR).
+    pub fn set_cpu_mode(&mut self, mode: u32) {
+        self.cpsr = (self.cpsr & !CPSR_MODE_MASK) | (mode & CPSR_MODE_MASK);
+    }
+
+    /// Returns true if IRQ interrupts are disabled.
+    pub fn irq_disabled(&self) -> bool {
+        (self.cpsr & CPSR_I) != 0
+    }
+
+    /// Sets or clears the IRQ disable bit.
+    pub fn set_irq_disabled(&mut self, val: bool) {
+        if val { self.cpsr |= CPSR_I; } else { self.cpsr &= !CPSR_I; }
+    }
+
+    /// Returns the Supervisor mode SPSR.
+    pub fn spsr_svc(&self) -> u32 {
+        self.spsr_svc
+    }
+
+    /// Sets the Supervisor mode SPSR.
+    pub fn set_spsr_svc(&mut self, val: u32) {
+        self.spsr_svc = val;
     }
 }
 
@@ -397,6 +442,15 @@ impl Cpu {
                 // Offset is relative to PC+8
                 format!("{}{} #{:+}", mnemonic, cs, offset.wrapping_add(8))
             }
+            // SWI
+            0b111 => {
+                if (instr >> 24) & 1 == 1 {
+                    let swi_num = instr & 0x00FF_FFFF;
+                    format!("SWI{} #0x{:06X}", cs, swi_num)
+                } else {
+                    format!("CDP{} (Coprocessor)", cs)
+                }
+            }
             _ => format!("??? ({:#010X})", instr),
         }
     }
@@ -459,8 +513,15 @@ impl Cpu {
             0b101 => self.execute_branch(instr, pc_at_fetch),
             // 110 = Coprocessor
             0b110 => self.log_unimplemented("Coprocessor", instr, pc_at_fetch),
-            // 111 = Software interrupt / Coprocessor
-            0b111 => self.log_unimplemented("SWI/Coprocessor", instr, pc_at_fetch),
+            // 111 = Software Interrupt (SWI) / Coprocessor
+            0b111 => {
+                // SWI is identified by bit 24 = 1
+                if (instr >> 24) & 1 == 1 {
+                    self.execute_swi(instr, pc_at_fetch);
+                } else {
+                    self.log_unimplemented("Coprocessor", instr, pc_at_fetch);
+                }
+            }
             _ => unreachable!(),
         }
 
@@ -733,6 +794,54 @@ impl Cpu {
             self.regs.set_thumb(false);
             self.regs.set_pc(target);
         }
+    }
+
+    // ── Software Interrupt (SWI / SVC) ────────────────────────────────
+
+    /// Executes a Software Interrupt (SWI / SVC) instruction.
+    ///
+    /// ARM encoding:  cond | 1111 | imm24
+    ///   imm24 [23:0]: syscall number
+    ///
+    /// Exception handling:
+    ///   1. Save current CPSR → SPSR_svc
+    ///   2. Save address of next instruction → LR (return address)
+    ///   3. Set CPU mode to Supervisor (0x13)
+    ///   4. Disable IRQ interrupts
+    ///   5. Force ARM mode (clear T flag)
+    ///   6. Set PC to SWI vector address (0x00000008)
+    fn execute_swi(&mut self, instr: u32, pc_at_fetch: u32) {
+        let syscall_num = instr & 0x00FF_FFFF;
+
+        // Debug log (via wasm_bindgen in non-test builds)
+        #[cfg(not(test))]
+        {
+            crate::log(&format!("\u{1F6A8} SWI executed: Syscall number 0x{:06X}", syscall_num));
+        }
+        #[cfg(test)]
+        {
+            let _ = syscall_num; // suppress unused warning in test
+        }
+
+        // 1. Save current CPSR into SPSR_svc
+        let saved_cpsr = self.regs.cpsr();
+        self.regs.set_spsr_svc(saved_cpsr);
+
+        // 2. Save return address (next instruction after SWI) into LR
+        //    PC was already advanced by advance_pc(), so pc_at_fetch + 4 = next instr
+        self.regs.set_lr(pc_at_fetch.wrapping_add(4));
+
+        // 3. Switch to Supervisor mode
+        self.regs.set_cpu_mode(MODE_SVC);
+
+        // 4. Disable IRQ interrupts
+        self.regs.set_irq_disabled(true);
+
+        // 5. Force ARM mode (clear Thumb flag)
+        self.regs.set_thumb(false);
+
+        // 6. Jump to SWI vector
+        self.regs.set_pc(SWI_VECTOR);
     }
 
     // ── Single Data Transfer (LDR / STR) ───────────────────────────────
@@ -1450,6 +1559,65 @@ mod tests {
 
         assert_eq!(cpu.regs.pc(), 0x100, "PC should be 0x100");
         assert!(!cpu.regs.is_thumb(), "T flag should be clear (staying ARM)");
+    }
+
+    // ── SWI tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_swi_exception() {
+        // SWI #0x42  (syscall 0x42)
+        // ARM encoding: cond=AL | 1111 | imm24=0x000042
+        //   = 0xEF000042
+        let program: Vec<u8> = [
+            0xE3A00005u32.to_le_bytes(), // MOV R0, #5  (at addr 0x00)
+            0xEF000042u32.to_le_bytes(), // SWI #0x42   (at addr 0x04)
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #5
+
+        // Before SWI: mode should be User (0x10)
+        assert_eq!(cpu.regs.cpu_mode(), 0x10, "Should be in User mode before SWI");
+
+        cpu.step(); // SWI #0x42
+
+        // After SWI:
+        // 1. Mode should be Supervisor (0x13)
+        assert_eq!(cpu.regs.cpu_mode(), 0x13, "Should switch to Supervisor mode");
+        // 2. LR should point to the instruction after SWI (0x04 + 4 = 0x08)
+        assert_eq!(cpu.regs.lr(), 0x08, "LR should be return address (next instr)");
+        // 3. IRQ should be disabled
+        assert!(cpu.regs.irq_disabled(), "IRQ should be disabled");
+        // 4. T flag should be clear (ARM mode)
+        assert!(!cpu.regs.is_thumb(), "Should be in ARM mode");
+        // 5. PC should be at SWI vector (0x08)
+        assert_eq!(cpu.regs.pc(), 0x08, "PC should jump to SWI vector 0x08");
+    }
+
+    #[test]
+    fn test_swi_preserves_spsr() {
+        // Verify that the original CPSR is saved into SPSR_svc
+        let program: Vec<u8> = [
+            0xE3A00001u32.to_le_bytes(), // MOV R0, #1
+            0xE3500001u32.to_le_bytes(), // CMP R0, #1  (sets Z flag)
+            0xEF000001u32.to_le_bytes(), // SWI #1
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #1
+        cpu.step(); // CMP R0, #1 → sets Z flag
+
+        // Capture CPSR before SWI (should have Z flag set + User mode)
+        let cpsr_before = cpu.regs.cpsr();
+        assert!(cpu.regs.flag_z(), "Z flag should be set before SWI");
+
+        cpu.step(); // SWI #1
+
+        // SPSR_svc should contain the pre-SWI CPSR
+        assert_eq!(cpu.regs.spsr_svc(), cpsr_before, "SPSR_svc should preserve original CPSR");
+        // Current CPSR should be different (SVC mode, IRQ disabled)
+        assert_ne!(cpu.regs.cpsr(), cpsr_before, "Current CPSR should differ after SWI");
+        assert_eq!(cpu.regs.cpu_mode(), 0x13, "Now in SVC mode");
     }
 }
 
