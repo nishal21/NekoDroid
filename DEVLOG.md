@@ -133,10 +133,34 @@
 
 ---
 
-## What's Next (Phase 1: Instruction Decoding)
+## Session 7: CPU Debug Panel
+**Date:** 2026-03-03  
+**Role:** WebAssembly & Frontend UI Engineer
+
+### What We Built
+- **Persistent ARM CPU** — `thread_local! RefCell<Option<Cpu>>` keeps the CPU across Wasm calls
+- **`get_cpu_state()`** — returns JSON with R0–R15, CPSR, N/Z/C/V/T flags, cycle count, halted state
+- **`step_cpu()`** — single-step execution, returns true if instruction ran
+- **`load_demo_program()`** — loads 10-instruction test program at 0x8000 (MOV/ADD/SUB/CMP/BEQ)
+- **Debug panel UI** — register grid (4×4), CPSR flag pills, Step/Load Demo/Run 10 buttons
+- **Live updates** at 5 Hz via `setInterval(updateDebugPanel, 200)`
+- **Register flash** — changed values glow cyan for 300ms
+
+### Verified
+- Load Demo → PC = 0x00008000 ✅
+- Step 1: R0 = 00000005 (MOV R0, #5) ✅
+- Step 2: R1 = 0000000A (MOV R1, #10) ✅
+- Step 3: R2 = 0000000F (ADD R2, R0, R1 = 15) ✅
+- PC increments by 4 each step ✅
+- No console errors ✅
+
+---
+
+## What's Next (Phase 2: Deeper Emulation)
 - [ ] Load/Store (LDR, STR) execution
 - [ ] Register shift operands (LSL, LSR, ASR, ROR)
-- [ ] BL (Branch with Link) testing
 - [ ] Load/Store Multiple (LDM, STM)
-- [ ] Test with longer ARM programs
+- [ ] Custom program loader (paste hex / upload binary)
+- [ ] Disassembly view in debug panel
+
 

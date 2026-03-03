@@ -7,6 +7,9 @@ import init, {
   wasm_memory,
   send_touch_event,
   send_key_event,
+  get_cpu_state,
+  step_cpu,
+  load_demo_program,
 } from '../pkg/nekodroid.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -72,6 +75,31 @@ app.innerHTML = `
       </div>
       <div class="console-log" id="console-log">
         <div class="log-entry log-system">Awaiting Wasm initialization...</div>
+      </div>
+    </div>
+
+    <div class="debug-panel" id="debug-panel">
+      <div class="debug-header">
+        <h2>🔧 ARMv7 CPU Debug</h2>
+        <div class="debug-controls">
+          <button id="btn-load-demo" class="debug-btn">
+            <span class="btn-icon">📦</span> Load Demo
+          </button>
+          <button id="btn-step" class="debug-btn">
+            <span class="btn-icon">⏭️</span> Step
+          </button>
+          <button id="btn-run10" class="debug-btn">
+            <span class="btn-icon">⏩</span> Run 10
+          </button>
+        </div>
+      </div>
+      <div class="register-grid" id="register-grid"></div>
+      <div class="flags-row" id="flags-row">
+        <span class="flag" id="flag-n">N</span>
+        <span class="flag" id="flag-z">Z</span>
+        <span class="flag" id="flag-c">C</span>
+        <span class="flag" id="flag-v">V</span>
+        <span class="flag flag-mode" id="flag-t">ARM</span>
       </div>
     </div>
 
@@ -269,6 +297,89 @@ async function main() {
     });
 
     addLog('Input pipeline active: mouse + keyboard → Wasm', 'success');
+
+    // ── Debug panel ─────────────────────────────────────────────────
+    const registerGrid = document.getElementById('register-grid')!;
+    const regNames = [
+      'R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7',
+      'R8', 'R9', 'R10', 'R11', 'R12', 'SP', 'LR', 'PC',
+    ];
+
+    // Build register cells
+    registerGrid.innerHTML = regNames.map((name, i) =>
+      `<div class="reg-cell" id="reg-${i}">
+        <span class="reg-name">${name}</span>
+        <span class="reg-value" id="reg-val-${i}">00000000</span>
+      </div>`
+    ).join('');
+
+    const flagN = document.getElementById('flag-n')!;
+    const flagZ = document.getElementById('flag-z')!;
+    const flagC = document.getElementById('flag-c')!;
+    const flagV = document.getElementById('flag-v')!;
+    const flagT = document.getElementById('flag-t')!;
+
+    function updateDebugPanel() {
+      try {
+        const state = JSON.parse(get_cpu_state());
+        if (state.error) return;
+
+        // Update register values
+        for (let i = 0; i < 16; i++) {
+          const el = document.getElementById(`reg-val-${i}`)!;
+          const val = state.regs[i] >>> 0; // unsigned
+          const hex = val.toString(16).toUpperCase().padStart(8, '0');
+          const prevHex = el.textContent;
+          el.textContent = hex;
+          // Flash changed registers
+          if (prevHex !== hex) {
+            el.classList.add('reg-changed');
+            setTimeout(() => el.classList.remove('reg-changed'), 300);
+          }
+        }
+
+        // Update flags
+        flagN.classList.toggle('flag-set', state.n);
+        flagZ.classList.toggle('flag-set', state.z);
+        flagC.classList.toggle('flag-set', state.c);
+        flagV.classList.toggle('flag-set', state.v);
+        flagT.textContent = state.t ? 'THUMB' : 'ARM';
+        flagT.classList.toggle('flag-set', state.t);
+      } catch (_) { /* ignore parse errors during init */ }
+    }
+
+    // Update debug panel at 5 Hz (200ms) to avoid performance impact
+    setInterval(updateDebugPanel, 200);
+    updateDebugPanel(); // initial render
+
+    // ── Debug buttons ─────────────────────────────────────────────────
+    document.getElementById('btn-load-demo')!.addEventListener('click', () => {
+      load_demo_program();
+      updateDebugPanel();
+      addLog('Demo program loaded — click Step to execute', 'success');
+    });
+
+    document.getElementById('btn-step')!.addEventListener('click', () => {
+      const ran = step_cpu();
+      updateDebugPanel();
+      if (ran) {
+        addLog('CPU stepped 1 instruction');
+      } else {
+        addLog('CPU halted — no instruction executed', 'system');
+      }
+    });
+
+    document.getElementById('btn-run10')!.addEventListener('click', () => {
+      let count = 0;
+      for (let i = 0; i < 10; i++) {
+        if (step_cpu()) count++;
+        else break;
+      }
+      updateDebugPanel();
+      addLog(`CPU stepped ${count} instructions`);
+    });
+
+    addLog('Debug panel active', 'success');
 
   } catch (err) {
     statusText.textContent = 'Failed to load Wasm module ✗';

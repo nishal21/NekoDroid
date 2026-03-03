@@ -157,6 +157,15 @@ pub fn wasm_memory() -> JsValue {
     wasm_bindgen::memory()
 }
 
+// ── Persistent ARM CPU ────────────────────────────────────────────────
+// Wasm is single-threaded, so thread_local + RefCell is safe.
+
+use std::cell::RefCell;
+
+thread_local! {
+    static ARM_CPU: RefCell<Option<cpu::Cpu>> = RefCell::new(None);
+}
+
 /// Initializes the emulator with configurable RAM.
 /// `ram_mb` is the RAM size in megabytes (e.g. 512, 1024, 2048).
 /// Pass 0 for the default (128 MB).
@@ -167,13 +176,92 @@ pub fn init_emulator(ram_mb: u32) {
     let ram_bytes = if ram_mb == 0 { 128 } else { ram_mb as usize } * 1024 * 1024;
     let mut arm_cpu = cpu::Cpu::new(ram_bytes);
     arm_cpu.regs.set_pc(0x0000_8000);
-    arm_cpu.regs.set_sp((ram_bytes as u32).wrapping_sub(0x1_0000)); // SP near top of RAM
+    arm_cpu.regs.set_sp((ram_bytes as u32).wrapping_sub(0x1_0000));
+
     log(&format!(
         "🔧 ARMv7 CPU ready — PC: {:#010X}, SP: {:#010X}, RAM: {} MB",
         arm_cpu.regs.pc(),
         arm_cpu.regs.sp(),
         ram_bytes / (1024 * 1024)
     ));
+
+    ARM_CPU.with(|cell| {
+        *cell.borrow_mut() = Some(arm_cpu);
+    });
+}
+
+/// Returns the CPU state as a JSON string for the debug panel.
+/// Format: {"regs":[r0..r15],"cpsr":u32,"n":bool,"z":bool,"c":bool,"v":bool,"t":bool,"cycles":u32,"halted":bool}
+#[wasm_bindgen]
+pub fn get_cpu_state() -> String {
+    ARM_CPU.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(cpu) => {
+                let regs: Vec<String> = (0..16)
+                    .map(|i| cpu.regs.read(i).to_string())
+                    .collect();
+                format!(
+                    r#"{{"regs":[{}],"cpsr":{},"n":{},"z":{},"c":{},"v":{},"t":{},"cycles":{},"halted":{}}}"#,
+                    regs.join(","),
+                    cpu.regs.cpsr(),
+                    cpu.regs.flag_n(),
+                    cpu.regs.flag_z(),
+                    cpu.regs.flag_c(),
+                    cpu.regs.flag_v(),
+                    cpu.regs.is_thumb(),
+                    CYCLE_COUNT.load(Ordering::Relaxed),
+                    cpu.halted,
+                )
+            }
+            None => r#"{"error":"CPU not initialized"}"#.to_string(),
+        }
+    })
+}
+
+/// Steps the CPU by one instruction. Returns true if it executed.
+#[wasm_bindgen]
+pub fn step_cpu() -> bool {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        match borrow.as_mut() {
+            Some(cpu) => {
+                let ran = cpu.step();
+                if ran {
+                    CYCLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                ran
+            }
+            None => false,
+        }
+    })
+}
+
+/// Loads a demo ARM program for debugging.
+/// This loads: MOV R0,#5 → MOV R1,#10 → ADD R2,R0,R1 → SUB R3,R2,#1 → CMP R3,#14 → loop back
+#[wasm_bindgen]
+pub fn load_demo_program() {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(cpu) = borrow.as_mut() {
+            let program: Vec<u8> = [
+                0xE3A00005u32.to_le_bytes(), // 0x8000: MOV R0, #5
+                0xE3A0100Au32.to_le_bytes(), // 0x8004: MOV R1, #10
+                0xE0802001u32.to_le_bytes(), // 0x8008: ADD R2, R0, R1
+                0xE2423001u32.to_le_bytes(), // 0x800C: SUB R3, R2, #1
+                0xE353000Eu32.to_le_bytes(), // 0x8010: CMP R3, #14
+                0x0A000000u32.to_le_bytes(), // 0x8014: BEQ +8 (skip next if equal)
+                0xE3A04001u32.to_le_bytes(), // 0x8018: MOV R4, #1  (not equal path)
+                0xEA000000u32.to_le_bytes(), // 0x801C: B +8 (skip to end)
+                0xE3A04000u32.to_le_bytes(), // 0x8020: MOV R4, #0  (equal path)
+                0xE1A00000u32.to_le_bytes(), // 0x8024: NOP (MOV R0, R0)
+            ].concat();
+
+            cpu.load_program(0x8000, &program);
+            log("📦 Demo program loaded at 0x8000 (10 ARM instructions)");
+            log("   MOV R0,#5 → MOV R1,#10 → ADD R2,R0,R1 → SUB R3,R2,#1 → CMP/BEQ logic");
+        }
+    });
 }
 
 /// Executes one CPU cycle, returns the new count.

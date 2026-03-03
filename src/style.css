@@ -366,3 +366,150 @@ body::before {
     border-bottom: 1px solid var(--border);
   }
 }
+
+/* ── Debug Panel ────────────────────────────────────────────────────── */
+
+.debug-panel {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  margin-top: 1rem;
+  overflow: hidden;
+}
+
+.debug-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.debug-header h2 {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--accent-glow);
+  letter-spacing: 0.02em;
+}
+
+.debug-controls {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.debug-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.4rem 0.7rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.debug-btn:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 12px rgba(124, 58, 237, 0.2);
+}
+
+.debug-btn:active {
+  transform: translateY(0);
+}
+
+.debug-btn .btn-icon {
+  font-size: 0.75rem;
+}
+
+/* Register grid */
+.register-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  padding: 0.5rem;
+  background: var(--bg-secondary);
+}
+
+.reg-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  background: var(--bg-primary);
+  border-radius: 0.35rem;
+  margin: 1px;
+}
+
+.reg-name {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  min-width: 1.5rem;
+  text-align: right;
+}
+
+.reg-value {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  letter-spacing: 0.04em;
+  transition: color 0.3s ease, text-shadow 0.3s ease;
+}
+
+.reg-value.reg-changed {
+  color: #22d3ee;
+  text-shadow: 0 0 8px rgba(34, 211, 238, 0.4);
+}
+
+/* CPSR flags */
+.flags-row {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.6rem 1rem;
+  border-top: 1px solid var(--border);
+  justify-content: center;
+}
+
+.flag {
+  padding: 0.25rem 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  border-radius: 0.35rem;
+  background: var(--bg-primary);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  transition: all 0.2s ease;
+  min-width: 2rem;
+  text-align: center;
+}
+
+.flag.flag-set {
+  color: #22d3ee;
+  background: rgba(34, 211, 238, 0.1);
+  border-color: rgba(34, 211, 238, 0.3);
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.15);
+}
+
+.flag.flag-mode {
+  min-width: 3.5rem;
+  color: var(--accent-glow);
+  border-color: var(--accent-dim);
+}
+
+.flag.flag-mode.flag-set {
+  color: var(--error);
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.3);
+}
