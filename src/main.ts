@@ -118,7 +118,7 @@ async function main() {
   try {
     // Initialize Wasm
     await init();
-    init_emulator();
+    init_emulator(128); // RAM in MB — increase for larger apps (e.g. 512, 1024)
 
     // Create VirtualCPU with framebuffer
     const cpu = new VirtualCPU();

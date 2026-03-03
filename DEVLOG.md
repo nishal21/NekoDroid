@@ -87,10 +87,28 @@
 
 ---
 
-## What's Next (Phase 1: Virtual CPU)
-- [ ] ARMv7 instruction decoder (Thumb + ARM mode)
-- [ ] Register file (R0–R15, CPSR)
-- [ ] Basic ALU operations (ADD, SUB, MOV, CMP, branch)
-- [ ] Memory bus abstraction (read/write 8/16/32-bit)
-- [ ] Interrupt controller stub
-- [ ] Unit test suite: run ARM assembly snippets and validate register state
+## Session 5: ARMv7 CPU Emulator Foundation
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **`src/memory.rs`** — `Mmu` struct: flat 16 MB RAM, `read_u8/u16/u32`, `write_u8/u16/u32` (little-endian), `load_bytes` for binary images
+- **`src/cpu.rs`** — `RegisterFile`: R0–R15 array + CPSR with N/Z/C/V/T flag accessors and `update_nz()` helper
+- **`src/cpu.rs`** — `Cpu` struct: owns `RegisterFile` + `Mmu`, with `fetch()` (ARM/Thumb aware), `advance_pc()`, `load_program()`, `reset()`
+- Wired modules into `lib.rs` via `pub mod cpu; pub mod memory;`
+- `init_emulator()` now creates a `Cpu` instance and logs: `ARMv7 CPU ready — PC: 0x00008000, SP: 0x007F0000, RAM: 16 MB`
+
+### Tests (all pass)
+- `test_read_write_u8`, `test_read_write_u16_little_endian`, `test_read_write_u32_little_endian`
+- `test_out_of_bounds_reads_zero`, `test_load_bytes`
+- `test_register_read_write`, `test_sp_lr_pc`, `test_cpsr_flags`, `test_thumb_mode`, `test_update_nz`
+- `test_cpu_fetch_arm`, `test_cpu_fetch_thumb`, `test_cpu_advance_pc`, `test_cpu_load_program`
+
+---
+
+## What's Next (Phase 1: Instruction Decoding)
+- [ ] ARM instruction decoder (condition codes, data processing, branch, load/store)
+- [ ] Basic ALU execution (ADD, SUB, MOV, CMP, AND, ORR, EOR)
+- [ ] Branch instruction execution (B, BL, BX)
+- [ ] Load/Store execution (LDR, STR)
+- [ ] Test with hand-assembled ARM binary snippets

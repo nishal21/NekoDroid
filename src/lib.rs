@@ -1,6 +1,10 @@
 use wasm_bindgen::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// ── CPU emulator modules ──────────────────────────────────────────────
+pub mod memory;
+pub mod cpu;
+
 // ── Browser bindings ──────────────────────────────────────────────────
 #[wasm_bindgen]
 extern "C" {
@@ -153,10 +157,23 @@ pub fn wasm_memory() -> JsValue {
     wasm_bindgen::memory()
 }
 
-/// Initializes the emulator and logs to console.
+/// Initializes the emulator with configurable RAM.
+/// `ram_mb` is the RAM size in megabytes (e.g. 512, 1024, 2048).
+/// Pass 0 for the default (128 MB).
 #[wasm_bindgen]
-pub fn init_emulator() {
+pub fn init_emulator(ram_mb: u32) {
     log("🐱 nekodroid: Wasm CPU Emulator Initialized!");
+
+    let ram_bytes = if ram_mb == 0 { 128 } else { ram_mb as usize } * 1024 * 1024;
+    let mut arm_cpu = cpu::Cpu::new(ram_bytes);
+    arm_cpu.regs.set_pc(0x0000_8000);
+    arm_cpu.regs.set_sp((ram_bytes as u32).wrapping_sub(0x1_0000)); // SP near top of RAM
+    log(&format!(
+        "🔧 ARMv7 CPU ready — PC: {:#010X}, SP: {:#010X}, RAM: {} MB",
+        arm_cpu.regs.pc(),
+        arm_cpu.regs.sp(),
+        ram_bytes / (1024 * 1024)
+    ));
 }
 
 /// Executes one CPU cycle, returns the new count.
