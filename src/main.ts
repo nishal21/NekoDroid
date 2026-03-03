@@ -5,6 +5,8 @@ import init, {
   execute_cycle,
   get_cycle_count,
   wasm_memory,
+  send_touch_event,
+  send_key_event,
 } from '../pkg/nekodroid.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -216,6 +218,57 @@ async function main() {
       btnPause.childNodes[1].textContent = paused ? ' Resume' : ' Pause';
       addLog(paused ? 'Rendering paused' : 'Rendering resumed');
     });
+
+    // ── Input event pipeline ──────────────────────────────────────────
+    // Translate browser CSS pixel coordinates → framebuffer pixel coordinates
+    function canvasCoords(e: MouseEvent): [number, number] {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = screenWidth / rect.width;
+      const scaleY = screenHeight / rect.height;
+      const x = Math.floor((e.clientX - rect.left) * scaleX);
+      const y = Math.floor((e.clientY - rect.top) * scaleY);
+      return [x, y];
+    }
+
+    let isMouseDown = false;
+
+    canvas.addEventListener('mousedown', (e) => {
+      isMouseDown = true;
+      const [x, y] = canvasCoords(e);
+      send_touch_event(x, y, true);
+      addLog(`Touch DOWN at (${x}, ${y})`);
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (!isMouseDown) return;
+      const [x, y] = canvasCoords(e);
+      send_touch_event(x, y, true);
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      isMouseDown = false;
+      const [x, y] = canvasCoords(e);
+      send_touch_event(x, y, false);
+      addLog(`Touch UP at (${x}, ${y})`);
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+      if (isMouseDown) {
+        isMouseDown = false;
+        send_touch_event(-1, -1, false);
+        addLog('Touch cancelled (cursor left canvas)');
+      }
+    });
+
+    // Keyboard input — canvas needs to be focusable
+    canvas.setAttribute('tabindex', '0');
+    canvas.addEventListener('keydown', (e) => {
+      e.preventDefault();
+      send_key_event(e.keyCode);
+      addLog(`Key pressed: ${e.key} (code=${e.keyCode})`);
+    });
+
+    addLog('Input pipeline active: mouse + keyboard → Wasm', 'success');
 
   } catch (err) {
     statusText.textContent = 'Failed to load Wasm module ✗';

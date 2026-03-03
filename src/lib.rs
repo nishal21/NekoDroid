@@ -171,3 +171,21 @@ pub fn execute_cycle() -> u32 {
 pub fn get_cycle_count() -> u32 {
     CYCLE_COUNT.load(Ordering::Relaxed)
 }
+
+// ── Input event handlers ──────────────────────────────────────────────
+
+/// Receives a touch/mouse event from the browser.
+/// `x` and `y` are canvas-relative pixel coordinates.
+/// `is_down` is true for press/move-while-pressed, false for release.
+#[wasm_bindgen]
+pub fn send_touch_event(x: i32, y: i32, is_down: bool) {
+    let action = if is_down { "DOWN" } else { "UP" };
+    log(&format!("👆 Touch {}: ({}, {})", action, x, y));
+}
+
+/// Receives a keyboard event from the browser.
+/// `keycode` is the DOM KeyboardEvent.keyCode value.
+#[wasm_bindgen]
+pub fn send_key_event(keycode: i32) {
+    log(&format!("⌨️ Key pressed: keycode={}", keycode));
+}
