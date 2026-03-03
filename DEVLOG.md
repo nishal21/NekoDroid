@@ -268,11 +268,32 @@
 
 ---
 
+## Session 13: Memory-Mapped I/O & Virtual UART
+**Date:** 2026-03-03  
+**Role:** Systems Engineer / Hardware Emulation Expert
+
+### What We Built
+- **MMIO interception** in `memory.rs` — all read/write methods check address against MMIO ranges before RAM access
+- **Virtual UART at 0x10000000:**
+  - TX (0x10000000): write a byte → accumulates in buffer; newline flushes to `console.log` with `📟 UART:` prefix
+  - RX (0x10000004): read stub, returns 0 (no incoming data)
+- **`uart_buffer()`** accessor for testing/debugging
+- `write_u16`/`write_u32` to UART TX: only sends low byte (like real UART)
+
+### Tests (39 total, all pass)
+- `test_uart_tx_buffer` — 'H' + 'i' → buffer = "Hi", newline clears ✅
+- `test_uart_tx_does_not_write_ram` — UART writes don't touch RAM ✅
+- `test_uart_rx_returns_zero` — UART RX read returns 0 ✅
+- `test_uart_write_u32_only_sends_low_byte` — 0x41 → 'A' ✅
+
+---
+
 ## What's Next (Phase 4)
 - [ ] BLX (Branch with Link and Exchange)
 - [ ] Halfword load/store (LDRH, STRH)
-- [ ] Memory-mapped I/O stubs
+- [ ] UART-based "Hello World" demo program
 - [ ] Basic syscall handler at vector 0x08
+
 
 
 
