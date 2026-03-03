@@ -259,8 +259,8 @@ impl Cpu {
             0b010 => self.execute_single_data_transfer(instr),
             // 011 = Load/Store (register offset)
             0b011 => self.execute_single_data_transfer(instr),
-            // 100 = Load/Store Multiple
-            0b100 => self.log_unimplemented("Load/Store Multiple", instr, pc_at_fetch),
+            // 100 = Load/Store Multiple (LDM / STM)
+            0b100 => self.execute_block_data_transfer(instr),
             // 101 = Branch (B / BL)
             0b101 => self.execute_branch(instr, pc_at_fetch),
             // 110 = Coprocessor
@@ -551,6 +551,73 @@ impl Cpu {
         // Pre-indexed with W=1, or post-indexed (always writes back)
         if (pre_index && write_back) || !pre_index {
             self.regs.write(rn, offset_addr);
+        }
+    }
+    // ── Block Data Transfer (LDM / STM) ────────────────────────────────
+
+    /// Decodes and executes a Block Data Transfer (LDM / STM) instruction.
+    ///
+    /// ARM encoding:  cond | 100 | P | U | S | W | L | Rn | register_list
+    ///   P (bit 24): 0 = post (after), 1 = pre (before)
+    ///   U (bit 23): 0 = down (decrement), 1 = up (increment)
+    ///   S (bit 22): PSR / force user mode (not implemented)
+    ///   W (bit 21): 1 = write-back (update Rn)
+    ///   L (bit 20): 0 = store (STM), 1 = load (LDM)
+    ///   Rn [19:16]: base register
+    ///   register_list [15:0]: bitmask of registers to transfer
+    ///
+    /// Addressing modes:
+    ///   P=0 U=1 → IA (Increment After)   — LDMIA / STMIA
+    ///   P=1 U=1 → IB (Increment Before)  — LDMIB / STMIB
+    ///   P=0 U=0 → DA (Decrement After)   — LDMDA / STMDA
+    ///   P=1 U=0 → DB (Decrement Before)  — LDMDB / STMDB / PUSH
+    fn execute_block_data_transfer(&mut self, instr: u32) {
+        let pre       = (instr >> 24) & 1 == 1;
+        let up        = (instr >> 23) & 1 == 1;
+        let write_back = (instr >> 21) & 1 == 1;
+        let load      = (instr >> 20) & 1 == 1;
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let reg_list = instr & 0xFFFF;
+
+        // Count how many registers are in the list
+        let reg_count = reg_list.count_ones();
+        let block_size = reg_count * 4; // each register is 4 bytes
+
+        let base = self.regs.read(rn);
+
+        // Calculate the start address based on addressing mode
+        let start_addr = match (pre, up) {
+            (false, true) => base,                              // IA: start at base
+            (true, true)  => base.wrapping_add(4),             // IB: start at base+4
+            (false, false) => base.wrapping_sub(block_size).wrapping_add(4), // DA
+            (true, false)  => base.wrapping_sub(block_size),   // DB (PUSH)
+        };
+
+        // Transfer registers — always iterate lowest register first
+        let mut addr = start_addr;
+        for i in 0..16u32 {
+            if reg_list & (1 << i) != 0 {
+                if load {
+                    // LDM: read from memory → register
+                    let val = self.mmu.read_u32(addr);
+                    self.regs.write(i as usize, val);
+                } else {
+                    // STM: register → write to memory
+                    let val = self.regs.read(i as usize);
+                    self.mmu.write_u32(addr, val);
+                }
+                addr = addr.wrapping_add(4);
+            }
+        }
+
+        // Write-back: update base register
+        if write_back {
+            let new_base = if up {
+                base.wrapping_add(block_size)
+            } else {
+                base.wrapping_sub(block_size)
+            };
+            self.regs.write(rn, new_base);
         }
     }
 
@@ -974,6 +1041,82 @@ mod tests {
 
         cpu.step(); // LDRB R2, [R1]
         assert_eq!(cpu.regs.read(2), 0xFF, "R2 should be 0xFF after LDRB");
+    }
+
+    // ── LDM/STM (block data transfer) tests ───────────────────────────
+
+    #[test]
+    fn test_push_pop_stack() {
+        // STMDB R13!, {R0, R1}  (PUSH R0, R1)
+        //   cond=AL 100 P=1 U=0 S=0 W=1 L=0 Rn=R13 reg_list=0x0003
+        //   = 0xE92D0003
+        //
+        // LDMIA R13!, {R2, R3}  (POP into R2, R3)
+        //   cond=AL 100 P=0 U=1 S=0 W=1 L=1 Rn=R13 reg_list=0x000C
+        //   = 0xE8BD000C
+        let program: Vec<u8> = [
+            0xE3A000AAu32.to_le_bytes(), // MOV R0, #0xAA
+            0xE3A010BBu32.to_le_bytes(), // MOV R1, #0xBB
+            0xE92D0003u32.to_le_bytes(), // STMDB R13!, {R0, R1}  (PUSH)
+            0xE8BD000Cu32.to_le_bytes(), // LDMIA R13!, {R2, R3}  (POP)
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.set_sp(0x1000); // Set SP (within 4KB test RAM)
+
+        cpu.step(); // MOV R0, #0xAA
+        cpu.step(); // MOV R1, #0xBB
+
+        assert_eq!(cpu.regs.read(0), 0xAA);
+        assert_eq!(cpu.regs.read(1), 0xBB);
+
+        cpu.step(); // STMDB R13!, {R0, R1} — PUSH
+
+        // SP should decrement by 8 (2 registers × 4 bytes)
+        assert_eq!(cpu.regs.sp(), 0x1000 - 8, "SP should decrement by 8 after PUSH");
+        // Memory: R0 at lower addr, R1 at higher (lowest-numbered reg at lowest addr)
+        assert_eq!(cpu.mmu.read_u32(0x0FF8), 0xAA, "R0 value at SP");
+        assert_eq!(cpu.mmu.read_u32(0x0FFC), 0xBB, "R1 value at SP+4");
+
+        cpu.step(); // LDMIA R13!, {R2, R3} — POP
+
+        // SP should be back to original
+        assert_eq!(cpu.regs.sp(), 0x1000, "SP should be restored after POP");
+        // R2 gets the value that was R0, R3 gets the value that was R1
+        assert_eq!(cpu.regs.read(2), 0xAA, "R2 should be 0xAA (popped R0's value)");
+        assert_eq!(cpu.regs.read(3), 0xBB, "R3 should be 0xBB (popped R1's value)");
+    }
+
+    #[test]
+    fn test_stm_ldm_multiple() {
+        // Store 4 registers, load them back into different registers
+        // STMIA R5, {R0-R3}  (no writeback)
+        //   cond=AL 100 P=0 U=1 S=0 W=0 L=0 Rn=R5 reg_list=0x000F
+        //   = 0xE885000F
+        // LDMIA R5, {R4, R6, R7, R8}  (no writeback)
+        //   cond=AL 100 P=0 U=1 S=0 W=0 L=1 Rn=R5 reg_list=0x01D0
+        //   = 0xE89501D0
+        let program: Vec<u8> = [
+            0xE3A0000Au32.to_le_bytes(), // MOV R0, #10
+            0xE3A01014u32.to_le_bytes(), // MOV R1, #20
+            0xE3A0201Eu32.to_le_bytes(), // MOV R2, #30
+            0xE3A03028u32.to_le_bytes(), // MOV R3, #40
+            0xE3A05C02u32.to_le_bytes(), // MOV R5, #0x200
+            0xE885000Fu32.to_le_bytes(), // STMIA R5, {R0-R3}
+            0xE89501D0u32.to_le_bytes(), // LDMIA R5, {R4, R6, R7, R8}
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        for _ in 0..7 { cpu.step(); }
+
+        // R4 gets value from addr 0x200 (was R0 = 10)
+        assert_eq!(cpu.regs.read(4), 10);
+        // R6 gets value from addr 0x204 (was R1 = 20)
+        assert_eq!(cpu.regs.read(6), 20);
+        // R7 gets value from addr 0x208 (was R2 = 30)
+        assert_eq!(cpu.regs.read(7), 30);
+        // R8 gets value from addr 0x20C (was R3 = 40)
+        assert_eq!(cpu.regs.read(8), 40);
     }
 }
 

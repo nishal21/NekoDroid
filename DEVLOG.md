@@ -182,11 +182,30 @@
 
 ---
 
-## What's Next (Phase 2: Deeper Emulation)
-- [ ] Load/Store Multiple (LDM, STM — for PUSH/POP)
+## Session 9: Block Data Transfer (LDM/STM)
+**Date:** 2026-03-03  
+**Role:** Systems Programmer / ARM Emulator Architect
+
+### What We Built
+- **`execute_block_data_transfer()`** — LDM/STM with all 4 addressing modes:
+  - IA (Increment After), IB (Increment Before)
+  - DA (Decrement After), DB (Decrement Before / PUSH)
+- Supports writeback (W bit) to update base register
+- Lowest-numbered register always at lowest address (ARM convention)
+- PUSH = STMDB SP!, POP = LDMIA SP!
+
+### Tests (29 total, all pass)
+- `test_push_pop_stack` — STMDB/LDMIA round-trip: PUSH {R0,R1}, POP {R2,R3} ✅
+- `test_stm_ldm_multiple` — STMIA/LDMIA 4-register transfer ✅
+
+---
+
+## What's Next (Phase 3)
 - [ ] Register-shifted register offsets (shift amount from Rs)
 - [ ] Custom program loader (paste hex / upload binary)
 - [ ] Disassembly view in debug panel
+- [ ] MUL / MLA (multiply instructions)
+
 
 
 
