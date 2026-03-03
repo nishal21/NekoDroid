@@ -256,9 +256,9 @@ impl Cpu {
             // 001 = Data Processing (immediate)
             0b001 => self.execute_data_processing(instr),
             // 010 = Load/Store (immediate offset)
-            0b010 => self.execute_load_store_stub(instr, pc_at_fetch),
+            0b010 => self.execute_single_data_transfer(instr),
             // 011 = Load/Store (register offset)
-            0b011 => self.execute_load_store_stub(instr, pc_at_fetch),
+            0b011 => self.execute_single_data_transfer(instr),
             // 100 = Load/Store Multiple
             0b100 => self.log_unimplemented("Load/Store Multiple", instr, pc_at_fetch),
             // 101 = Branch (B / BL)
@@ -305,12 +305,55 @@ impl Cpu {
         }
     }
 
+    // ── Barrel Shifter ─────────────────────────────────────────────────
+
+    /// Applies a barrel shift operation to a value.
+    ///
+    /// shift_type: 0=LSL, 1=LSR, 2=ASR, 3=ROR
+    /// shift_amount: number of bits to shift (0–31)
+    fn shift_operand(value: u32, shift_type: u8, shift_amount: u32) -> u32 {
+        if shift_amount == 0 {
+            return value; // No shift (LSL #0 = identity)
+        }
+        match shift_type {
+            0 => { // LSL — Logical Shift Left
+                if shift_amount >= 32 { 0 } else { value << shift_amount }
+            }
+            1 => { // LSR — Logical Shift Right
+                if shift_amount >= 32 { 0 } else { value >> shift_amount }
+            }
+            2 => { // ASR — Arithmetic Shift Right (preserves sign)
+                if shift_amount >= 32 {
+                    if value & 0x8000_0000 != 0 { 0xFFFF_FFFF } else { 0 }
+                } else {
+                    ((value as i32) >> shift_amount) as u32
+                }
+            }
+            3 => { // ROR — Rotate Right
+                value.rotate_right(shift_amount)
+            }
+            _ => value,
+        }
+    }
+
+    /// Decodes the register operand2 field, including barrel shift.
+    ///
+    /// Encoding: [11:8]=shift_amount [6:5]=shift_type [4]=0 [3:0]=Rm
+    ///   (bit 4 = 0: shift by immediate, bit 4 = 1: shift by register — we handle immediate here)
+    fn decode_register_operand(&self, instr: u32) -> u32 {
+        let rm = (instr & 0xF) as usize;
+        let rm_val = self.regs.read(rm);
+        let shift_type = ((instr >> 5) & 0x3) as u8;
+        let shift_amount = (instr >> 7) & 0x1F;
+        Self::shift_operand(rm_val, shift_type, shift_amount)
+    }
+
     // ── Data Processing ───────────────────────────────────────────────
 
     /// Decodes and executes a Data Processing instruction.
     ///
     /// ARM encoding:  cond | 00 | I | opcode | S | Rn | Rd | operand2
-    ///   I (bit 25): 1 = immediate, 0 = register
+    ///   I (bit 25): 1 = immediate, 0 = register (with barrel shift)
     ///   opcode (bits [24:21]): ALU operation
     ///   S (bit 20): 1 = update CPSR flags
     ///   Rn (bits [19:16]): first operand register
@@ -329,9 +372,8 @@ impl Cpu {
             let rotate = ((instr >> 8) & 0xF) * 2;
             imm8.rotate_right(rotate)
         } else {
-            // Register: Rm (bits [3:0]) — simplified, no shift for now
-            let rm = (instr & 0xF) as usize;
-            self.regs.read(rm)
+            // Register with barrel shift
+            self.decode_register_operand(instr)
         };
 
         let rn_val = self.regs.read(rn);
@@ -441,16 +483,82 @@ impl Cpu {
         self.regs.set_pc(target);
     }
 
-    // ── Load/Store stub ───────────────────────────────────────────────
+    // ── Single Data Transfer (LDR / STR) ───────────────────────────────
 
-    fn execute_load_store_stub(&mut self, instr: u32, pc: u32) {
-        self.log_unimplemented("Load/Store", instr, pc);
+    /// Decodes and executes a Single Data Transfer (LDR / STR) instruction.
+    ///
+    /// ARM encoding:  cond | 01 | I | P | U | B | W | L | Rn | Rd | offset
+    ///   I (bit 25): 0 = immediate offset, 1 = register offset (shifted)
+    ///   P (bit 24): 1 = pre-indexed, 0 = post-indexed
+    ///   U (bit 23): 1 = add offset, 0 = subtract offset
+    ///   B (bit 22): 1 = byte transfer, 0 = word transfer
+    ///   W (bit 21): 1 = write-back (update Rn), 0 = no write-back
+    ///   L (bit 20): 1 = load (LDR), 0 = store (STR)
+    ///   Rn (bits [19:16]): base register
+    ///   Rd (bits [15:12]): destination (LDR) or source (STR) register
+    ///   offset: 12-bit immediate (I=0) or register+shift (I=1)
+    fn execute_single_data_transfer(&mut self, instr: u32) {
+        let is_reg_offset = (instr >> 25) & 1 == 1;
+        let pre_index     = (instr >> 24) & 1 == 1;
+        let up            = (instr >> 23) & 1 == 1;
+        let byte_transfer = (instr >> 22) & 1 == 1;
+        let write_back    = (instr >> 21) & 1 == 1;
+        let load          = (instr >> 20) & 1 == 1;
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let rd = ((instr >> 12) & 0xF) as usize;
+
+        // Compute the offset
+        let offset = if is_reg_offset {
+            // Register offset with barrel shift
+            self.decode_register_operand(instr)
+        } else {
+            // 12-bit immediate offset
+            instr & 0xFFF
+        };
+
+        let base = self.regs.read(rn);
+
+        // Calculate the effective address
+        let offset_addr = if up {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+
+        // Pre-indexed: use offset address, Post-indexed: use base
+        let addr = if pre_index { offset_addr } else { base };
+
+        // Execute the transfer
+        if load {
+            // LDR: read from memory → Rd
+            let val = if byte_transfer {
+                self.mmu.read_u8(addr) as u32
+            } else {
+                self.mmu.read_u32(addr)
+            };
+            self.regs.write(rd, val);
+        } else {
+            // STR: Rd → write to memory
+            let val = self.regs.read(rd);
+            if byte_transfer {
+                self.mmu.write_u8(addr, (val & 0xFF) as u8);
+            } else {
+                self.mmu.write_u32(addr, val);
+            }
+        }
+
+        // Write-back: update base register
+        // Pre-indexed with W=1, or post-indexed (always writes back)
+        if (pre_index && write_back) || !pre_index {
+            self.regs.write(rn, offset_addr);
+        }
     }
+
+    // ── Unimplemented handler ─────────────────────────────────────────
 
     fn log_unimplemented(&self, category: &str, instr: u32, pc: u32) {
         #[cfg(not(test))]
         {
-            // Only log in non-test builds to avoid noise
             let _ = (category, instr, pc);
         }
         #[cfg(test)]
@@ -729,6 +837,143 @@ mod tests {
 
         assert_eq!(cpu.regs.read(1), 99, "R1 should be 99 (EQ condition met)");
         assert_eq!(cpu.regs.read(2), 0, "R2 should be 0 (NE condition NOT met)");
+    }
+
+    // ── Barrel shifter tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_shift_lsl() {
+        // MOV R1, #3    → E3A01003
+        // MOV R0, R1, LSL #2 → E1A00101
+        //   bits: cond=AL 000 opcode=1101(MOV) S=0 Rn=0 Rd=0 shift_amount=00010 type=00(LSL) 0 Rm=0001
+        //   = E | 1A0 | 0 | 1 | 0 | 1
+        //   = 0xE1A00101
+        //   R0 = 3 << 2 = 12
+        let program: Vec<u8> = [
+            0xE3A01003u32.to_le_bytes(), // MOV R1, #3
+            0xE1A00101u32.to_le_bytes(), // MOV R0, R1, LSL #2
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R1, #3
+        cpu.step(); // MOV R0, R1, LSL #2
+        assert_eq!(cpu.regs.read(0), 12, "3 << 2 = 12");
+    }
+
+    #[test]
+    fn test_shift_lsr() {
+        // MOV R1, #32   → E3A01020
+        // MOV R0, R1, LSR #3 → E1A001A1
+        //   shift_amount=00011 type=01(LSR) 0 Rm=R1
+        //   R0 = 32 >> 3 = 4
+        let program: Vec<u8> = [
+            0xE3A01020u32.to_le_bytes(), // MOV R1, #32
+            0xE1A001A1u32.to_le_bytes(), // MOV R0, R1, LSR #3
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        assert_eq!(cpu.regs.read(0), 4, "32 >> 3 = 4");
+    }
+
+    #[test]
+    fn test_add_with_shift() {
+        // R1 = 10, R2 = 3
+        // ADD R0, R1, R2, LSL #1 → R0 = 10 + (3 << 1) = 16
+        // E0810082
+        //   cond=AL 000 opcode=0100(ADD) S=0 Rn=R1 Rd=R0 shift=00001 type=00(LSL) 0 Rm=R2
+        let program: Vec<u8> = [
+            0xE3A0100Au32.to_le_bytes(), // MOV R1, #10
+            0xE3A02003u32.to_le_bytes(), // MOV R2, #3
+            0xE0810082u32.to_le_bytes(), // ADD R0, R1, R2, LSL #1
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R1, #10
+        cpu.step(); // MOV R2, #3
+        cpu.step(); // ADD R0, R1, R2, LSL #1
+        assert_eq!(cpu.regs.read(0), 16, "10 + (3 << 1) = 16");
+    }
+
+    // ── Load/Store tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_basic_str_ldr() {
+        // STR R0, [R1]  — store R0 at address in R1
+        // LDR R2, [R1]  — load from address in R1 into R2
+        //
+        // STR R0, [R1, #0] → E5810000
+        //   cond=AL 01 I=0 P=1 U=1 B=0 W=0 L=0 Rn=R1 Rd=R0 offset=0
+        // LDR R2, [R1, #0] → E5912000
+        //   cond=AL 01 I=0 P=1 U=1 B=0 W=0 L=1 Rn=R1 Rd=R2 offset=0
+        let program: Vec<u8> = [
+            0xE3A000FFu32.to_le_bytes(), // MOV R0, #255
+            0xE3A01C01u32.to_le_bytes(), // MOV R1, #256 (0x100)
+            0xE5810000u32.to_le_bytes(), // STR R0, [R1]
+            0xE5912000u32.to_le_bytes(), // LDR R2, [R1]
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #255
+        cpu.step(); // MOV R1, #256
+        cpu.step(); // STR R0, [R1]
+
+        // Verify memory was written
+        assert_eq!(cpu.mmu.read_u32(0x100), 255, "Memory at 0x100 should be 255");
+
+        cpu.step(); // LDR R2, [R1]
+        assert_eq!(cpu.regs.read(2), 255, "R2 should be 255 after LDR");
+    }
+
+    #[test]
+    fn test_str_pre_indexed_writeback() {
+        // STR R0, [R1, #4]! — store R0 at R1+4, then R1 = R1+4
+        //
+        // E5A10004:
+        //   cond=AL 01 I=0 P=1 U=1 B=0 W=1 L=0 Rn=R1 Rd=R0 offset=4
+        let program: Vec<u8> = [
+            0xE3A0002Au32.to_le_bytes(), // MOV R0, #42
+            0xE3A01C01u32.to_le_bytes(), // MOV R1, #256 (0x100)
+            0xE5A10004u32.to_le_bytes(), // STR R0, [R1, #4]!
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #42
+        cpu.step(); // MOV R1, #256
+        cpu.step(); // STR R0, [R1, #4]!
+
+        assert_eq!(cpu.mmu.read_u32(0x104), 42, "Memory at 0x104 should be 42");
+        assert_eq!(cpu.regs.read(1), 0x104, "R1 should be updated to 0x104 (writeback)");
+    }
+
+    #[test]
+    fn test_ldrb_strb() {
+        // STRB R0, [R1] — store low byte of R0
+        // LDRB R2, [R1] — load byte into R2
+        //
+        // STRB R0, [R1, #0] → E5C10000
+        //   cond=AL 01 I=0 P=1 U=1 B=1 W=0 L=0 Rn=R1 Rd=R0 offset=0
+        // LDRB R2, [R1, #0] → E5D12000
+        //   cond=AL 01 I=0 P=1 U=1 B=1 W=0 L=1 Rn=R1 Rd=R2 offset=0
+        let program: Vec<u8> = [
+            0xE3A000FFu32.to_le_bytes(), // MOV R0, #255
+            0xE3A01C02u32.to_le_bytes(), // MOV R1, #512 (0x200)
+            0xE5C10000u32.to_le_bytes(), // STRB R0, [R1]
+            0xE5D12000u32.to_le_bytes(), // LDRB R2, [R1]
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MOV R0, #255
+        cpu.step(); // MOV R1, #512
+        cpu.step(); // STRB R0, [R1]
+
+        assert_eq!(cpu.mmu.read_u8(0x200), 0xFF, "Byte at 0x200 should be 0xFF");
+        // Only 1 byte written — next byte should be 0
+        assert_eq!(cpu.mmu.read_u8(0x201), 0x00);
+
+        cpu.step(); // LDRB R2, [R1]
+        assert_eq!(cpu.regs.read(2), 0xFF, "R2 should be 0xFF after LDRB");
     }
 }
 

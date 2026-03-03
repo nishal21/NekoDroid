@@ -156,11 +156,37 @@
 
 ---
 
+## Session 8: Barrel Shifter & Load/Store Instructions
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Barrel Shifter** — `shift_operand(value, shift_type, shift_amount)`: LSL, LSR, ASR, ROR
+- **`decode_register_operand()`** — extracts Rm, shift_type (bits [6:5]), shift_amount (bits [11:7]) and applies barrel shift
+- **Integrated into Data Processing** — register operand2 path now uses barrel shift instead of raw Rm
+- **`execute_single_data_transfer()`** — full LDR/STR decode with all control bits:
+  - I (bit 25): immediate vs register offset
+  - P (bit 24): pre-indexed vs post-indexed
+  - U (bit 23): add vs subtract offset
+  - B (bit 22): byte vs word transfer
+  - W (bit 21): write-back to base register
+  - L (bit 20): load vs store
+
+### Tests (27 total, all pass)
+- `test_shift_lsl` — MOV R0, R1, LSL #2: 3 << 2 = 12 ✅
+- `test_shift_lsr` — MOV R0, R1, LSR #3: 32 >> 3 = 4 ✅
+- `test_add_with_shift` — ADD R0, R1, R2, LSL #1: 10 + (3 << 1) = 16 ✅
+- `test_basic_str_ldr` — STR/LDR round-trip at address 0x100 ✅
+- `test_str_pre_indexed_writeback` — STR R0, [R1, #4]! writes and updates R1 ✅
+- `test_ldrb_strb` — STRB/LDRB byte-level transfer ✅
+
+---
+
 ## What's Next (Phase 2: Deeper Emulation)
-- [ ] Load/Store (LDR, STR) execution
-- [ ] Register shift operands (LSL, LSR, ASR, ROR)
-- [ ] Load/Store Multiple (LDM, STM)
+- [ ] Load/Store Multiple (LDM, STM — for PUSH/POP)
+- [ ] Register-shifted register offsets (shift amount from Rs)
 - [ ] Custom program loader (paste hex / upload binary)
 - [ ] Disassembly view in debug panel
+
 
 
