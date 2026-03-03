@@ -312,9 +312,32 @@
 
 ---
 
-## What's Next (Phase 4)
-- [ ] UART-based "Hello World" demo program
-- [ ] Basic syscall handler at vector 0x08
+## Session 15: High-Level Emulation (HLE) BIOS
+**Date:** 2026-03-03  
+**Role:** Systems Programmer / OS Architect
+
+### What We Built
+- **BIOS Intercept**: Modified `step()` in `cpu.rs` to intercept execution whenever `PC == 0x08` and the CPU is in Supervisor mode (`MODE_SVC`).
+- **Syscall Handling**:
+  - Implemented `handle_bios_syscall()` to process ARM Linux syscalls written in Rust instead of executing ARM assembly.
+  - Added support for Syscall `0x04` (`sys_write`):
+    - Reads string pointer from `R1` and length from `R2`.
+    - Iterates over MMU to reconstruct the string.
+    - Logs the output directly to the browser console using `crate::log()` with a `⚙️ BIOS sys_write:` prefix.
+- **Exception Return**:
+  - Simulated `MOVS PC, LR` after processing the syscall.
+  - Restores CPSR from `SPSR_svc` to return to User mode.
+  - Sets PC back to the saved returning instruction address (`R14` / `LR`).
+
+### Tests (45 total, all pass)
+- `test_bios_sys_write` — Validates the `0x04` syscall intercept. Confirms string reading logic and verifies the CPU correctly returns to User mode (`MODE_USER`) and the next PC address. ✅
+
+---
+
+## What's Next (Phase 5)
+- [ ] UART-based "Hello World" demo program in ARM assembly
+- [ ] Multi-file structured tests
+
 
 
 

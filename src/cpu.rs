@@ -510,6 +510,14 @@ impl Cpu {
             return false;
         }
 
+        // ── HLE BIOS Intercept ────────────────────────────────────────
+        // If the PC has reached the SWI vector (0x08) AND we are in Supervisor mode,
+        // intercept execution to handle the syscall in Rust instead of executing ARM code.
+        if self.regs.pc() == SWI_VECTOR && self.regs.cpu_mode() == MODE_SVC {
+            self.handle_bios_syscall();
+            return true;
+        }
+
         // ── FETCH ─────────────────────────────────────────────────────
         let instr = self.fetch();
         let pc_at_fetch = self.regs.pc();
@@ -961,6 +969,58 @@ impl Cpu {
         self.regs.set_irq_disabled(true);
         self.regs.set_thumb(false);
         self.regs.set_pc(SWI_VECTOR);
+    }
+
+    // ── High-Level Emulation (HLE) BIOS ──────────────────────────────
+
+    /// Intercepts execution at the SWI vector (0x08) to simulate an OS kernel.
+    fn handle_bios_syscall(&mut self) {
+        // The original SWI instruction is at LR - 4 (LR points to the instruction AFTER SWI)
+        let swi_addr = self.regs.lr().wrapping_sub(4);
+        let swi_instr = self.mmu.read_u32(swi_addr);
+        let syscall_num = swi_instr & 0x00FF_FFFF;
+
+        match syscall_num {
+            // Linux sys_write (fd, buf, count)
+            0x04 => {
+                let _fd = self.regs.read(0);
+                let ptr = self.regs.read(1);
+                let len = self.regs.read(2);
+
+                let mut string_buf = String::new();
+                for i in 0..len {
+                    let b = self.mmu.read_u8(ptr.wrapping_add(i));
+                    string_buf.push(b as char);
+                }
+
+                #[cfg(not(test))]
+                {
+                    crate::log(&format!("⚙️ BIOS sys_write: {}", string_buf));
+                }
+                #[cfg(test)]
+                {
+                    let _ = string_buf; // avoid unused warning
+                }
+
+                // Return bytes written in R0 (simulate success)
+                self.regs.write(0, len);
+            }
+            _ => {
+                #[cfg(not(test))]
+                {
+                    crate::log(&format!("⚠️ Unimplemented BIOS syscall: 0x{:06X}", syscall_num));
+                }
+            }
+        }
+
+        // Exception return (simulate MOVS PC, LR)
+        // 1. Restore CPSR from SPSR_svc
+        let saved_cpsr = self.regs.spsr_svc();
+        self.regs.set_cpsr(saved_cpsr);
+        
+        // 2. Set PC to return address (LR)
+        let return_pc = self.regs.lr();
+        self.regs.set_pc(return_pc);
     }
 
     // ── Single Data Transfer (LDR / STR) ───────────────────────────────
@@ -1737,6 +1797,50 @@ mod tests {
         // Current CPSR should be different (SVC mode, IRQ disabled)
         assert_ne!(cpu.regs.cpsr(), cpsr_before, "Current CPSR should differ after SWI");
         assert_eq!(cpu.regs.cpu_mode(), 0x13, "Now in SVC mode");
+    }
+
+    #[test]
+    fn test_bios_sys_write() {
+        // Setup a sys_write (0x04) SWI
+        // R0 = 1 (stdout)
+        // R1 = 0x200 (string pointer)
+        // R2 = 5 ("Hello" length)
+        let program: Vec<u8> = [
+            0xE3A00001u32.to_le_bytes(), // MOV R0, #1
+            0xE3A01C02u32.to_le_bytes(), // MOV R1, #0x200
+            0xE3A02005u32.to_le_bytes(), // MOV R2, #5
+            0xEF000004u32.to_le_bytes(), // SWI #4
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        
+        // Write "Hello" to RAM at 0x200
+        cpu.mmu.write_u8(0x200, b'H');
+        cpu.mmu.write_u8(0x201, b'e');
+        cpu.mmu.write_u8(0x202, b'l');
+        cpu.mmu.write_u8(0x203, b'l');
+        cpu.mmu.write_u8(0x204, b'o');
+
+        // Step through MOVs
+        cpu.step(); // MOV R0
+        cpu.step(); // MOV R1
+        cpu.step(); // MOV R2
+
+        // Step SWI — this will set PC to 0x08, mode to SVC
+        let cpsr_before = cpu.regs.cpsr();
+        cpu.step();
+        assert_eq!(cpu.regs.pc(), 0x08, "PC should be at SWI vector");
+        assert_eq!(cpu.regs.cpu_mode(), 0x13, "Should be in SVC mode");
+
+        // Now step again — this should trigger handle_bios_syscall()
+        cpu.step();
+
+        // 1. R0 should contain the bytes written (5)
+        assert_eq!(cpu.regs.read(0), 5, "R0 should contain bytes written");
+        // 2. CPSR should be restored to pre-SWI state (User mode)
+        assert_eq!(cpu.regs.cpsr(), cpsr_before, "CPSR should be restored");
+        // 3. PC should be restored to next instruction (0x10)
+        assert_eq!(cpu.regs.pc(), 0x10, "PC should return from exception");
     }
 
     // ── BLX tests ────────────────────────────────────────────────────
