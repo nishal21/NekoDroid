@@ -1477,3 +1477,152 @@ Build exception-mode infrastructure and a universal exception entry path to supp
 
 ### Verification
 - `cargo test --lib --quiet` → **80 passed, 0 failed** ✅
+
+---
+
+## Session 47 — Versatile PB MMIO Map for Linux Early Printk
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / Emulation Architect
+
+### Goal
+Adapt MMIO behavior to match ARM Versatile PB expectations (`machine_id=0x0183`) so Linux early printk can write through PL011 UART without aborting on peripheral accesses.
+
+### Changes
+
+**`src/memory.rs`**
+- Added Versatile PB constants:
+  - `VPB_VIC_BASE = 0x10140000`
+  - `VPB_TIMER_BASE = 0x101E2000`
+  - `VPB_UART0_BASE = 0x101F1000`
+  - `VPB_PERIPH_START = 0x10100000`
+  - `VPB_PERIPH_END = 0x101FFFFF`
+- Added unified peripheral detection (`is_periph`) spanning legacy MMIO and VPB window.
+- Added PL011 UART alias for kernel output:
+  - Writes to `0x101F1000` treated as TX data register writes
+  - Low byte emitted into UART buffer
+  - Newline flush logs with `🐧 KERNEL:` prefix
+- Added PL011 flag register stub:
+  - Reads at `0x101F1018` return `0` (TX FIFO not full)
+- Added VPB stubs to avoid aborts:
+  - VIC region reads return `0`
+  - Timer region reads return `0`
+  - Other VPB reads default to `0`
+  - Unknown VPB writes are ignored
+- Integrated these behaviors into `read_u8/u16/u32` and `write_u8/u16/u32` MMIO interception paths.
+
+**`src/memory/tests.rs`**
+- Added `test_vpb_uart0_dr_alias_write` (write to `0x101F1000` routes to UART buffer)
+- Added `test_vpb_uartfr_returns_not_full` (read `0x101F1018` returns 0)
+
+### Verification
+- `cargo test memory::tests -- --nocapture` → **21 passed, 0 failed** ✅
+- `cargo test --lib --quiet` → **82 passed, 0 failed** ✅
+
+---
+
+## Session 48 — SP804 Dual Timer (Timer1) Emulation
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / Emulation Architect
+
+### Goal
+Implement enough of the ARM Versatile PB SP804 Timer1 hardware model for Linux early boot timing/calibration paths (down-counter behavior, load/value/control registers).
+
+### Changes
+
+**`src/memory.rs`**
+- Added SP804 Timer1 state fields to `Mmu`:
+  - `timer1_load: u32`
+  - `timer1_value: u32`
+  - `timer1_ctrl: u32`
+- Initialized all three fields to `0` in `Mmu::new()`.
+- Replaced VPB timer read stub with register map for `VPB_TIMER_BASE..VPB_TIMER_BASE+0x20`:
+  - `+0x00` → `Timer1Load`
+  - `+0x04` → `Timer1Value`
+  - `+0x08` → `Timer1Control`
+  - others return `0`
+- Added timer write handling in `write_u32` for `VPB_TIMER_BASE..VPB_TIMER_BASE+0x20`:
+  - `+0x00`: writes `timer1_load` and mirrors into `timer1_value`
+  - `+0x04`: writes `timer1_value`
+  - `+0x08`: writes `timer1_ctrl`
+  - `+0x0C`: interrupt clear (no-op for now)
+- Kept `read_u8/u16` and `write_u8/u16` behavior safe via existing MMIO routing/ignore semantics.
+
+**`src/cpu.rs`**
+- Added `tick_sp804_timer()` and called it at the end of every successful `step()` path (including early returns):
+  - BIOS SWI intercept path
+  - Thumb dispatch path
+  - condition-failed skip path
+  - coprocessor-transfer early-return path
+  - normal ARM decode/execute path
+- Timer tick behavior:
+  - Enable bit: `timer1_ctrl & 0x80`
+  - Counter decrements by 1 each CPU step
+  - On underflow:
+    - periodic mode (`0x40`) reloads from `timer1_load`
+    - otherwise free-running wraps to `0xFFFFFFFF`
+
+### Tests
+
+**`src/memory/tests.rs`**
+- Added `test_sp804_timer`:
+  1. Writes `10` to `Timer1Load` (`VPB_TIMER_BASE+0x00`)
+  2. Verifies `Timer1Value` (`+0x04`) is `10`
+  3. Enables timer via `Timer1Control` (`+0x08`) with `0x80`
+  4. Runs `cpu.step()` 5 times
+  5. Verifies `Timer1Value == 5`
+
+### Verification
+- `cargo test test_sp804_timer -- --nocapture` ✅
+- `cargo test --lib --quiet` → **83 passed, 0 failed** ✅
+
+---
+
+## Session 49 — PL190 VIC + Timer IRQ Wiring
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / Emulation Architect
+
+### Goal
+Implement core PL190 VIC state and connect SP804 Timer1 underflow interrupts to the CPU IRQ exception path so hardware IRQ delivery works end-to-end.
+
+### Changes
+
+**`src/memory.rs`**
+- Added PL190 VIC state to `Mmu`:
+  - `vic_int_enable: u32`
+  - `vic_int_status: u32`
+  - `irq_pending: bool`
+- Added `update_vic()` helper:
+  - `irq_pending = (vic_int_status & vic_int_enable) != 0`
+- Implemented VIC MMIO reads (`VPB_VIC_BASE..+0x1000`):
+  - `+0x000` → `VICIRQStatus` (`vic_int_status`)
+  - `+0x010` → `VICIntEnable` (`vic_int_enable`)
+- Implemented VIC MMIO writes:
+  - `+0x010` (`VICIntEnable`) OR-enables bits and updates VIC wire
+  - `+0x014` (`VICIntEnClear`) clears bits and updates VIC wire
+- Updated SP804 `Timer1IntClr` (`VPB_TIMER_BASE + 0x0C`):
+  - clears VIC line 4 (`vic_int_status &= !(1 << 4)`)
+  - calls `update_vic()`
+
+**`src/cpu.rs`**
+- Updated SP804 underflow logic in `tick_sp804_timer()`:
+  - existing reload/free-run behavior preserved
+  - if `timer1_ctrl` bit 5 (interrupt enable) is set:
+    - sets `vic_int_status` bit 4
+    - calls `update_vic()`
+- Added IRQ pre-check at the top of `step()` before instruction fetch:
+  - if `mmu.irq_pending` and CPSR.I is clear:
+    - takes IRQ exception via `trigger_exception("IRQ", MODE_IRQ, 0x18, 4)`
+    - returns immediately for that cycle
+
+**`src/memory/tests.rs`**
+- Added `test_vic_enable_and_clear`
+  - verifies IRQ line only asserts when active interrupt is enabled
+  - verifies disable clears pending wire
+- Added `test_timer_intclr_clears_vic_line4`
+  - verifies Timer1IntClr clears line 4 and drops IRQ pending
+
+### Verification
+- `cargo test test_vic_enable_and_clear -- --nocapture` ✅
+- `cargo test test_timer_intclr_clears_vic_line4 -- --nocapture` ✅
+- `cargo test test_sp804_timer -- --nocapture` ✅
+- `cargo test --lib --quiet` → **85 passed, 0 failed** ✅

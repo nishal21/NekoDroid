@@ -81,6 +81,73 @@
         assert_eq!(mmu.uart_buffer(), "A");
     }
 
+    #[test]
+    fn test_vpb_uart0_dr_alias_write() {
+        let mut mmu = Mmu::new(256);
+        mmu.write_u32(0x101F_1000, 0x42); // 'B' to PL011 DR
+        assert_eq!(mmu.uart_buffer(), "B");
+    }
+
+    #[test]
+    fn test_vpb_uartfr_returns_not_full() {
+        let mmu = Mmu::new(256);
+        assert_eq!(mmu.read_u32(0x101F_1018), 0);
+    }
+
+    #[test]
+    fn test_sp804_timer() {
+        let mut mmu = Mmu::new(256);
+
+        mmu.write_u32(VPB_TIMER_BASE + 0x00, 10);
+        assert_eq!(mmu.read_u32(VPB_TIMER_BASE + 0x04), 10);
+
+        mmu.write_u32(VPB_TIMER_BASE + 0x08, 0x80);
+
+        let mut cpu = crate::cpu::Cpu::new(4096);
+        cpu.mmu.timer1_load = mmu.timer1_load;
+        cpu.mmu.timer1_value = mmu.timer1_value;
+        cpu.mmu.timer1_ctrl = mmu.timer1_ctrl;
+
+        cpu.mmu.write_u32(0, 0xE1A0_0000); // NOP
+        cpu.regs.set_pc(0);
+
+        for _ in 0..5 {
+            cpu.step();
+        }
+
+        assert_eq!(cpu.mmu.timer1_value, 5);
+    }
+
+    #[test]
+    fn test_vic_enable_and_clear() {
+        let mut mmu = Mmu::new(256);
+
+        mmu.vic_int_status = 1 << 4;
+        mmu.update_vic();
+        assert!(!mmu.irq_pending, "IRQ should be low when line is not enabled");
+
+        mmu.write_u32(VPB_VIC_BASE + 0x010, 1 << 4); // VICIntEnable
+        assert_eq!(mmu.vic_int_enable & (1 << 4), 1 << 4);
+        assert!(mmu.irq_pending, "IRQ should go high when active line is enabled");
+
+        mmu.write_u32(VPB_VIC_BASE + 0x014, 1 << 4); // VICIntEnClear
+        assert_eq!(mmu.vic_int_enable & (1 << 4), 0);
+        assert!(!mmu.irq_pending, "IRQ should drop when line is disabled");
+    }
+
+    #[test]
+    fn test_timer_intclr_clears_vic_line4() {
+        let mut mmu = Mmu::new(256);
+
+        mmu.vic_int_status = 1 << 4;
+        mmu.write_u32(VPB_VIC_BASE + 0x010, 1 << 4); // enable line 4
+        assert!(mmu.irq_pending);
+
+        mmu.write_u32(VPB_TIMER_BASE + 0x0C, 1); // Timer1IntClr
+        assert_eq!(mmu.vic_int_status & (1 << 4), 0);
+        assert!(!mmu.irq_pending);
+    }
+
     // ── VRAM ─────────────────────────────────────────────────────────
 
     #[test]

@@ -891,6 +891,31 @@ impl Cpu {
         }
     }
 
+    /// Advances SP804 Timer1 by one CPU step.
+    fn tick_sp804_timer(&mut self) {
+        // Timer1Control bit 7: Enable
+        if (self.mmu.timer1_ctrl & 0x80) != 0 {
+            let (new_val, underflow) = self.mmu.timer1_value.overflowing_sub(1);
+            self.mmu.timer1_value = new_val;
+
+            if underflow {
+                // Timer1Control bit 6: Periodic mode
+                if (self.mmu.timer1_ctrl & 0x40) != 0 {
+                    self.mmu.timer1_value = self.mmu.timer1_load;
+                } else {
+                    // Free-running mode wraps
+                    self.mmu.timer1_value = 0xFFFF_FFFF;
+                }
+
+                // Timer1Control bit 5: interrupt enable
+                if (self.mmu.timer1_ctrl & 0x20) != 0 {
+                    self.mmu.vic_int_status |= 1 << 4; // Timer1 on VIC line 4
+                    self.mmu.update_vic();
+                }
+            }
+        }
+    }
+
     // ── Fetch-Decode-Execute ──────────────────────────────────────────
 
     /// Executes one instruction cycle: fetch → decode → execute.
@@ -900,6 +925,16 @@ impl Cpu {
             return false;
         }
 
+        // Check for pending hardware IRQ before executing next instruction.
+        if self.mmu.irq_pending {
+            let cpsr = self.regs.cpsr();
+            if (cpsr & 0x80) == 0 {
+                self.trigger_exception("IRQ", MODE_IRQ, 0x18, 4);
+                self.tick_sp804_timer();
+                return true;
+            }
+        }
+
         self.exception_raised = false;
 
         // ── HLE BIOS Intercept ────────────────────────────────────────
@@ -907,6 +942,7 @@ impl Cpu {
         // intercept execution to handle the syscall in Rust instead of executing ARM code.
         if self.regs.pc() == SWI_VECTOR && self.regs.cpu_mode() == MODE_SVC {
             self.handle_bios_syscall();
+            self.tick_sp804_timer();
             return true;
         }
 
@@ -923,6 +959,7 @@ impl Cpu {
             self.regs.pipeline_offset = 2; // advance_pc added 2, so +2 more = +4 from fetch
             self.execute_thumb_instruction(instr as u16, pc_at_fetch);
             self.regs.pipeline_offset = 0;
+            self.tick_sp804_timer();
             return true;
         }
 
@@ -930,6 +967,7 @@ impl Cpu {
         // ARM instructions bits [31:28] are the condition code.
         // If the condition is not met, the instruction is a NOP.
         if !self.check_condition(instr) {
+            self.tick_sp804_timer();
             return true; // Instruction skipped, but CPU is not halted
         }
 
@@ -961,6 +999,7 @@ impl Cpu {
             }
 
             self.regs.pipeline_offset = 0;
+            self.tick_sp804_timer();
             return true;
         }
 
@@ -1017,6 +1056,7 @@ impl Cpu {
         }
 
         self.regs.pipeline_offset = 0;
+        self.tick_sp804_timer();
 
         true
     }
