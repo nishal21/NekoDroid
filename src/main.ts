@@ -12,10 +12,22 @@ import init, {
   load_demo_program,
   load_custom_hex,
   load_rom,
+  get_vram_ptr,
+  get_vram_len,
+  tick_sys_timer,
+  get_audio_ctrl,
+  get_audio_freq,
 } from '../pkg/nekodroid.js';
 
+// ── Web Audio API state ────────────────────────────────────────────────
+let audioCtx: AudioContext | null = null;
+let oscillator: OscillatorNode | null = null;
+let gainNode: GainNode | null = null;
+let isAudioInitialized = false;
+const WAVEFORMS: OscillatorType[] = ['square', 'sine', 'sawtooth', 'triangle'];
+
 // ── Types ──────────────────────────────────────────────────────────────
-type RenderMode = 'noise' | 'gradient' | 'plasma';
+type RenderMode = 'noise' | 'gradient' | 'plasma' | 'vram';
 
 // ── Build the UI ───────────────────────────────────────────────────────
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -49,6 +61,10 @@ app.innerHTML = `
       <button id="btn-plasma">
         <span class="btn-icon">🔮</span>
         Plasma
+      </button>
+      <button id="btn-vram">
+        <span class="btn-icon">🖥️</span>
+        VRAM
       </button>
       <button id="btn-pause">
         <span class="btn-icon">⏸️</span>
@@ -96,6 +112,9 @@ app.innerHTML = `
           <button id="btn-run10" class="debug-btn">
             <span class="btn-icon">⏩</span> Run 10
           </button>
+          <button id="btn-run" class="debug-btn" style="background: linear-gradient(135deg, #065f46, #059669); border-color: #10b981;">
+            <span class="btn-icon">▶️</span> Run
+          </button>
         </div>
       </div>
       <div class="register-grid" id="register-grid"></div>
@@ -140,6 +159,7 @@ canvasWrapper.appendChild(canvas);
 const btnNoise = document.getElementById('btn-noise') as HTMLButtonElement;
 const btnGradient = document.getElementById('btn-gradient') as HTMLButtonElement;
 const btnPlasma = document.getElementById('btn-plasma') as HTMLButtonElement;
+const btnVram = document.getElementById('btn-vram') as HTMLButtonElement;
 const btnPause = document.getElementById('btn-pause') as HTMLButtonElement;
 const fpsDisplay = document.getElementById('fps-display')!;
 const frameCountEl = document.getElementById('frame-count')!;
@@ -183,6 +203,8 @@ async function main() {
     // ── Render state ──────────────────────────────────────────────
     let mode: RenderMode = 'noise';
     let paused = false;
+    let running = false;  // Continuous CPU execution mode
+    const BATCH_SIZE = 500000; // Instructions per frame in run mode
     let frameNumber = 0;
     let lastTime = performance.now();
     let fpsFrames = 0;
@@ -214,16 +236,80 @@ async function main() {
           case 'plasma':
             cpu.render_plasma(frameNumber * 0.03);
             break;
+          case 'vram':
+            // VRAM mode: no render call needed — CPU writes directly to VRAM
+            break;
         }
 
         // Execute a CPU cycle per frame
         execute_cycle();
+
+        // Tick the system timer (~60 Hz VSYNC)
+        tick_sys_timer();
+
+        // If running continuously, execute a batch of CPU instructions
+        if (running) {
+          let halted = false;
+          for (let i = 0; i < BATCH_SIZE; i++) {
+            if (!step_cpu()) {
+              halted = true;
+              break;
+            }
+          }
+          if (halted) {
+            running = false;
+            const btnRun = document.getElementById('btn-run')!;
+            btnRun.querySelector('.btn-icon')!.textContent = '▶️';
+            btnRun.childNodes[1].textContent = ' Run';
+            (btnRun as HTMLButtonElement).style.background = 'linear-gradient(135deg, #065f46, #059669)';
+            (btnRun as HTMLButtonElement).style.borderColor = '#10b981';
+            addLog(`CPU halted after ${get_cycle_count()} cycles`, 'success');
+            updateDebugPanel();
+          }
+        }
+
+        // Process deferred touch release AFTER batch (ensures CPU sees touch for ≥1 full frame)
+        if (pendingRelease) {
+          send_touch_event(pendingRelease.x, pendingRelease.y, false);
+          addLog(`Touch UP at (${pendingRelease.x}, ${pendingRelease.y})`);
+          pendingRelease = null;
+        }
+
+        // ── Audio sync: read CPU audio registers → Web Audio API ────
+        if (isAudioInitialized && oscillator && audioCtx) {
+          const ctrl = get_audio_ctrl();
+          const freq = get_audio_freq();
+
+          const enabled = (ctrl & 1) === 1;
+          const waveType = (ctrl >> 1) & 3;
+
+          if (enabled) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            oscillator.type = WAVEFORMS[waveType];
+            // Smoothly transition frequency to avoid audio popping
+            oscillator.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.015);
+          } else {
+            if (audioCtx.state === 'running') audioCtx.suspend();
+          }
+        }
+
         frameNumber++;
 
         // ── Read Wasm memory directly via the pointer ─────────
-        const ptr = cpu.framebuffer_ptr();
-        const len = cpu.framebuffer_len();
         const mem = wasm_memory() as WebAssembly.Memory;
+        let ptr: number;
+        let len: number;
+
+        if (mode === 'vram') {
+          // Read from CPU's VRAM (written by ARM programs)
+          ptr = get_vram_ptr();
+          len = get_vram_len();
+        } else {
+          // Read from VirtualCPU's demo framebuffer
+          ptr = cpu.framebuffer_ptr();
+          len = cpu.framebuffer_len();
+        }
+
         const wasmMemory = new Uint8ClampedArray(
           mem.buffer,
           ptr,
@@ -248,7 +334,7 @@ async function main() {
     addLog('Render loop started at 60 FPS target', 'success');
 
     // ── Mode buttons ──────────────────────────────────────────────
-    const modeButtons = [btnNoise, btnGradient, btnPlasma];
+    const modeButtons = [btnNoise, btnGradient, btnPlasma, btnVram];
 
     function setMode(newMode: RenderMode, btn: HTMLButtonElement) {
       mode = newMode;
@@ -261,6 +347,7 @@ async function main() {
     btnNoise.addEventListener('click', () => setMode('noise', btnNoise));
     btnGradient.addEventListener('click', () => setMode('gradient', btnGradient));
     btnPlasma.addEventListener('click', () => setMode('plasma', btnPlasma));
+    btnVram.addEventListener('click', () => setMode('vram', btnVram));
 
     btnPause.addEventListener('click', () => {
       paused = !paused;
@@ -281,8 +368,26 @@ async function main() {
     }
 
     let isMouseDown = false;
+    let pendingRelease: { x: number; y: number } | null = null;
+
+    // ── Audio initialization (requires user gesture) ───────────────
+    function initAudio() {
+      if (isAudioInitialized) return;
+      audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = 0.1; // Keep volume reasonable
+      gainNode.connect(audioCtx.destination);
+
+      oscillator = audioCtx.createOscillator();
+      oscillator.connect(gainNode);
+      oscillator.start();
+      isAudioInitialized = true;
+      addLog('🔊 Web Audio initialized', 'success');
+    }
+    canvas.addEventListener('mousedown', initAudio, { once: true });
 
     canvas.addEventListener('mousedown', (e) => {
+      pendingRelease = null; // cancel any pending release
       isMouseDown = true;
       const [x, y] = canvasCoords(e);
       send_touch_event(x, y, true);
@@ -298,15 +403,14 @@ async function main() {
     canvas.addEventListener('mouseup', (e) => {
       isMouseDown = false;
       const [x, y] = canvasCoords(e);
-      send_touch_event(x, y, false);
-      addLog(`Touch UP at (${x}, ${y})`);
+      // Defer release to next frame so CPU sees touch_down=true for ≥1 frame
+      pendingRelease = { x, y };
     });
 
     canvas.addEventListener('mouseleave', () => {
       if (isMouseDown) {
         isMouseDown = false;
-        send_touch_event(-1, -1, false);
-        addLog('Touch cancelled (cursor left canvas)');
+        pendingRelease = { x: -1, y: -1 };
       }
     });
 
@@ -314,8 +418,11 @@ async function main() {
     canvas.setAttribute('tabindex', '0');
     canvas.addEventListener('keydown', (e) => {
       e.preventDefault();
-      send_key_event(e.keyCode);
-      addLog(`Key pressed: ${e.key} (code=${e.keyCode})`);
+      send_key_event(e.keyCode, true);
+    });
+    canvas.addEventListener('keyup', (e) => {
+      e.preventDefault();
+      send_key_event(e.keyCode, false);
     });
 
     addLog('Input pipeline active: mouse + keyboard → Wasm', 'success');
@@ -446,6 +553,26 @@ async function main() {
       addLog(`CPU stepped ${count} instructions`);
     });
 
+    // ── Run/Stop toggle ─────────────────────────────────────────────
+    const btnRun = document.getElementById('btn-run')!;
+    btnRun.addEventListener('click', () => {
+      running = !running;
+      if (running) {
+        btnRun.querySelector('.btn-icon')!.textContent = '⏹️';
+        btnRun.childNodes[1].textContent = ' Stop';
+        (btnRun as HTMLButtonElement).style.background = 'linear-gradient(135deg, #7f1d1d, #dc2626)';
+        (btnRun as HTMLButtonElement).style.borderColor = '#ef4444';
+        addLog(`CPU running (${BATCH_SIZE.toLocaleString()} instructions/frame)...`, 'success');
+      } else {
+        btnRun.querySelector('.btn-icon')!.textContent = '▶️';
+        btnRun.childNodes[1].textContent = ' Run';
+        (btnRun as HTMLButtonElement).style.background = 'linear-gradient(135deg, #065f46, #059669)';
+        (btnRun as HTMLButtonElement).style.borderColor = '#10b981';
+        addLog(`CPU stopped at cycle ${get_cycle_count()}`);
+        updateDebugPanel();
+      }
+    });
+
     addLog('Debug panel active', 'success');
 
     // ── Hex upload ──────────────────────────────────────────────────
@@ -480,8 +607,11 @@ async function main() {
         const bytes = new Uint8Array(buffer);
         const ok = load_rom(bytes);
         if (ok) {
+          // Auto-switch to VRAM render mode so CPU-drawn pixels are visible
+          setMode('vram', btnVram);
           updateDebugPanel();
           addLog(`ROM loaded: ${file.name} (${bytes.length} bytes)`, 'success');
+          addLog('Render mode auto-switched to VRAM — CPU can draw to 0x04000000', 'info');
         } else {
           addLog('Failed to load ROM — is the emulator initialized?', 'system');
         }

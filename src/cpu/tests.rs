@@ -517,6 +517,82 @@
         assert_eq!(cpu.regs.read(0), 40, "5 * 6 + 10 = 40");
     }
 
+    #[test]
+    fn test_umull() {
+        // UMULL R0, R1, R2, R3  → {R1,R0} = R2 * R3 (unsigned 64-bit)
+        // ARM encoding: cond | 00001 | U=0 | A=0 | S=0 | RdHi | RdLo | Rs | 1001 | Rm
+        //   RdHi=R1, RdLo=R0, Rs=R3, Rm=R2
+        //   = 0xE0810392
+        // R2 = 0xFFFFFFFF, R3 = 3 → result = 0x2_FFFFFFFD
+        let program: Vec<u8> = [
+            0xE3E02000u32.to_le_bytes(), // MVN R2, #0 → R2 = 0xFFFFFFFF
+            0xE3A03003u32.to_le_bytes(), // MOV R3, #3
+            0xE0810392u32.to_le_bytes(), // UMULL R0, R1, R2, R3
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); // MVN R2 → 0xFFFFFFFF
+        cpu.step(); // MOV R3, #3
+        cpu.step(); // UMULL R0, R1, R2, R3
+        // 0xFFFFFFFF * 3 = 0x2_FFFFFFFD
+        assert_eq!(cpu.regs.read(0), 0xFFFFFFFD, "UMULL lo = 0xFFFFFFFD");
+        assert_eq!(cpu.regs.read(1), 0x00000002, "UMULL hi = 0x00000002");
+    }
+
+    #[test]
+    fn test_umull_simple() {
+        // UMULL R0, R1, R2, R3  → {R1,R0} = R2 * R3
+        // R2 = 7, R3 = 8 → result = 56 (fits in low word)
+        let program: Vec<u8> = [
+            0xE3A02007u32.to_le_bytes(), // MOV R2, #7
+            0xE3A03008u32.to_le_bytes(), // MOV R3, #8
+            0xE0810392u32.to_le_bytes(), // UMULL R0, R1, R2, R3
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); cpu.step(); cpu.step();
+        assert_eq!(cpu.regs.read(0), 56, "UMULL 7*8 lo = 56");
+        assert_eq!(cpu.regs.read(1), 0,  "UMULL 7*8 hi = 0");
+    }
+
+    #[test]
+    fn test_smull() {
+        // SMULL R0, R1, R2, R3  → {R1,R0} = R2 * R3 (signed 64-bit)
+        // ARM encoding: U=1, A=0 → bits[22:21] = 10
+        //   = 0xE0C10392
+        // R2 = -5 (0xFFFFFFFB), R3 = 3 → result = -15 (0xFFFFFFFF_FFFFFFF1)
+        let program: Vec<u8> = [
+            0xE3E02004u32.to_le_bytes(), // MVN R2, #4 → R2 = -5
+            0xE3A03003u32.to_le_bytes(), // MOV R3, #3
+            0xE0C10392u32.to_le_bytes(), // SMULL R0, R1, R2, R3
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); cpu.step(); cpu.step();
+        assert_eq!(cpu.regs.read(0), 0xFFFFFFF1, "SMULL -5*3 lo = 0xFFFFFFF1");
+        assert_eq!(cpu.regs.read(1), 0xFFFFFFFF, "SMULL -5*3 hi = 0xFFFFFFFF");
+    }
+
+    #[test]
+    fn test_umlal() {
+        // UMLAL R0, R1, R2, R3  → {R1,R0} += R2 * R3 (unsigned 64-bit accumulate)
+        // ARM encoding: U=0, A=1 → bits[22:21] = 01
+        //   = 0xE0A10392
+        // Initial: R0=100, R1=0, R2=10, R3=5 → 100 + 50 = 150
+        let program: Vec<u8> = [
+            0xE3A00064u32.to_le_bytes(), // MOV R0, #100
+            0xE3A01000u32.to_le_bytes(), // MOV R1, #0
+            0xE3A0200Au32.to_le_bytes(), // MOV R2, #10
+            0xE3A03005u32.to_le_bytes(), // MOV R3, #5
+            0xE0A10392u32.to_le_bytes(), // UMLAL R0, R1, R2, R3
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step(); cpu.step(); cpu.step(); cpu.step(); cpu.step();
+        assert_eq!(cpu.regs.read(0), 150, "UMLAL 100 + 10*5 lo = 150");
+        assert_eq!(cpu.regs.read(1), 0,   "UMLAL 100 + 10*5 hi = 0");
+    }
+
     // ── BX tests ─────────────────────────────────────────────────────
 
     #[test]
@@ -1095,4 +1171,44 @@
         cpu.step(); // Execute Suffix — jumps to target, saves return address
         assert_eq!(cpu.regs.pc(), 0x100C, "BL target should be 0x100C");
         assert_eq!(cpu.regs.lr(), 0x1005, "LR should be return addr 0x1004 | 1 for Thumb");
+    }
+
+    // ── UMULL division-by-reciprocal test (timer % 200) ───────────────
+
+    #[test]
+    fn test_umull_modulo_200() {
+        // Reproduces the exact GCC timer%200 sequence from input_test.elf
+        // We set R10=450 and R3=magic, then run the exact instructions
+        let mut cpu = Cpu::new(65536); // 64KB RAM (need address 0x8000+)
+        cpu.reset();
+
+        // Manually set registers
+        cpu.regs.write(10, 450);           // sl = timer = 450
+        cpu.regs.write(3, 0x51EB851F);     // magic reciprocal for /200
+
+        // Load the exact instruction sequence into RAM at 0x8000
+        let instrs: Vec<u32> = vec![
+            0xE083239A, // UMULL R2, R3, R10, R3  → {R3,R2} = R10 * R3
+            0xE1A03323, // LSR R3, R3, #6          → quotient = hi >> 6
+            0xE0833103, // ADD R3, R3, R3, LSL #2  → r3 *= 5
+            0xE0833103, // ADD R3, R3, R3, LSL #2  → r3 *= 25 total
+            0xE04A3183, // SUB R3, R10, R3, LSL #3 → r3 = timer - q*200
+        ];
+        for (i, &instr) in instrs.iter().enumerate() {
+            let addr = 0x8000 + (i as u32) * 4;
+            cpu.mmu.write_u32(addr, instr);
+        }
+        cpu.regs.set_pc(0x8000);
+
+        // Verify UMULL
+        cpu.step();
+        let product: u64 = 450u64 * 0x51EB851Fu64;
+        assert_eq!(cpu.regs.read(2), product as u32, "UMULL lo");
+        assert_eq!(cpu.regs.read(3), (product >> 32) as u32, "UMULL hi");
+
+        cpu.step(); // LSR
+        cpu.step(); // ADD *5
+        cpu.step(); // ADD *25
+        cpu.step(); // SUB → remainder
+        assert_eq!(cpu.regs.read(3), 50, "450 % 200 should be 50");
     }

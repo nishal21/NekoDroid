@@ -261,6 +261,8 @@ impl Cpu {
         self.halted = false;
         // Clear UART output buffer
         self.mmu.clear_uart_buffer();
+        // Clear VRAM to black
+        self.mmu.clear_vram();
         // Set SP to top of RAM minus 64 KB (matches init_emulator convention)
         self.regs.set_sp((self.mmu.ram_size() as u32).wrapping_sub(0x1_0000));
         // Set PC to standard boot address
@@ -328,21 +330,37 @@ impl Cpu {
         match bits_27_25 {
             // Data Processing
             0b000 | 0b001 => {
-                // Check for Multiply: bits [7:4] = 1001, bits [27:22] = 000000 or 000001
-                if bits_27_25 == 0b000 && (instr & 0x0FC0_00F0) == 0x0000_0090 {
+                // Check for Multiply (short & long): bits [27:24] = 0000, bits [7:4] = 1001
+                if bits_27_25 == 0b000 && (instr & 0x0F00_00F0) == 0x0000_0090 {
+                    let is_long = (instr >> 23) & 1 == 1;
                     let a = (instr >> 21) & 1 == 1;
-                    let rd = (instr >> 16) & 0xF;
-                    let rn = (instr >> 12) & 0xF;
                     let rs = (instr >> 8) & 0xF;
                     let rm = instr & 0xF;
-                    if a {
-                        return format!("MLA{} {}, {}, {}, {}", cs,
-                            Self::reg_name(rd), Self::reg_name(rm),
-                            Self::reg_name(rs), Self::reg_name(rn));
+                    if is_long {
+                        let u = (instr >> 22) & 1 == 1;
+                        let rd_hi = (instr >> 16) & 0xF;
+                        let rd_lo = (instr >> 12) & 0xF;
+                        let mnemonic = match (u, a) {
+                            (false, false) => "UMULL",
+                            (false, true)  => "UMLAL",
+                            (true,  false) => "SMULL",
+                            (true,  true)  => "SMLAL",
+                        };
+                        return format!("{}{} {}, {}, {}, {}", mnemonic, cs,
+                            Self::reg_name(rd_lo), Self::reg_name(rd_hi),
+                            Self::reg_name(rm), Self::reg_name(rs));
                     } else {
-                        return format!("MUL{} {}, {}, {}", cs,
-                            Self::reg_name(rd), Self::reg_name(rm),
-                            Self::reg_name(rs));
+                        let rd = (instr >> 16) & 0xF;
+                        let rn = (instr >> 12) & 0xF;
+                        if a {
+                            return format!("MLA{} {}, {}, {}, {}", cs,
+                                Self::reg_name(rd), Self::reg_name(rm),
+                                Self::reg_name(rs), Self::reg_name(rn));
+                        } else {
+                            return format!("MUL{} {}, {}, {}", cs,
+                                Self::reg_name(rd), Self::reg_name(rm),
+                                Self::reg_name(rs));
+                        }
                     }
                 }
                 // Check for BLX (register)
@@ -357,7 +375,7 @@ impl Cpu {
                 }
                 // Check for halfword/signed transfers
                 if bits_27_25 == 0b000 && (instr & 0x90) == 0x90 && (instr & 0x0E000000) == 0
-                    && (instr & 0x0FC000F0) != 0x00000090 {
+                    && (instr & 0x0F0000F0) != 0x00000090 {
                     let pre   = (instr >> 24) & 1 == 1;
                     let up    = (instr >> 23) & 1 == 1;
                     let load  = (instr >> 20) & 1 == 1;
@@ -572,8 +590,8 @@ impl Cpu {
         match bits_27_25 {
             // 000 = Data Processing (register) / Multiply / Misc
             0b000 => {
-                // Check for Multiply: bits [7:4] = 1001 and bits [27:22] = 000000 or 000001
-                if (instr & 0x0FC0_00F0) == 0x0000_0090 {
+                // Check for Multiply (short & long): bits [27:24] = 0000, bits [7:4] = 1001
+                if (instr & 0x0F00_00F0) == 0x0000_0090 {
                     self.execute_multiply(instr);
                 }
                 // Check for BLX (register): bits [27:4] = 0x012FFF3
@@ -832,38 +850,75 @@ impl Cpu {
         self.regs.set_pc(target);
     }
 
-    // ── Multiply (MUL / MLA) ─────────────────────────────────────────
+    // ── Multiply (MUL / MLA / UMULL / UMLAL / SMULL / SMLAL) ────────
 
-    /// Decodes and executes a Multiply (MUL) or Multiply-Accumulate (MLA).
+    /// Decodes and executes all multiply instructions.
     ///
-    /// ARM encoding:  cond | 000000 | A | S | Rd | Rn | Rs | 1001 | Rm
-    ///   A (bit 21): 0 = MUL, 1 = MLA (add Rn)
-    ///   S (bit 20): 1 = update CPSR flags
-    ///   Rd [19:16]: destination register
-    ///   Rn [15:12]: accumulate register (MLA only)
-    ///   Rs [11:8]:  multiplier register
-    ///   Rm [3:0]:   multiplicand register
+    /// Short multiply (bit 23 = 0):
+    ///   cond | 000000 | A | S | Rd | Rn | Rs | 1001 | Rm
+    ///   A (bit 21): 0 = MUL, 1 = MLA
+    ///
+    /// Long multiply (bit 23 = 1):
+    ///   cond | 00001 | U | A | S | RdHi | RdLo | Rs | 1001 | Rm
+    ///   U (bit 22): 0 = unsigned, 1 = signed
+    ///   A (bit 21): 0 = multiply, 1 = multiply-accumulate
     fn execute_multiply(&mut self, instr: u32) {
-        let accumulate = (instr >> 21) & 1 == 1;
+        let is_long    = (instr >> 23) & 1 == 1;
         let set_flags  = (instr >> 20) & 1 == 1;
-        let rd = ((instr >> 16) & 0xF) as usize;
-        let rn = ((instr >> 12) & 0xF) as usize;
         let rs = ((instr >> 8) & 0xF) as usize;
         let rm = (instr & 0xF) as usize;
 
         let rm_val = self.regs.read(rm);
         let rs_val = self.regs.read(rs);
 
-        let result = if accumulate {
-            let rn_val = self.regs.read(rn);
-            rm_val.wrapping_mul(rs_val).wrapping_add(rn_val) // MLA: Rd = Rm * Rs + Rn
-        } else {
-            rm_val.wrapping_mul(rs_val) // MUL: Rd = Rm * Rs
-        };
+        if is_long {
+            // Long multiply: UMULL / UMLAL / SMULL / SMLAL
+            let signed     = (instr >> 22) & 1 == 1;
+            let accumulate = (instr >> 21) & 1 == 1;
+            let rd_hi = ((instr >> 16) & 0xF) as usize;
+            let rd_lo = ((instr >> 12) & 0xF) as usize;
 
-        self.regs.write(rd, result);
-        if set_flags {
-            self.regs.update_nz(result);
+            let result: u64 = if signed {
+                (rm_val as i32 as i64).wrapping_mul(rs_val as i32 as i64) as u64
+            } else {
+                (rm_val as u64).wrapping_mul(rs_val as u64)
+            };
+
+            let result = if accumulate {
+                let hi = self.regs.read(rd_hi) as u64;
+                let lo = self.regs.read(rd_lo) as u64;
+                result.wrapping_add((hi << 32) | lo)
+            } else {
+                result
+            };
+
+            self.regs.write(rd_lo, result as u32);
+            self.regs.write(rd_hi, (result >> 32) as u32);
+            if set_flags {
+                let n = (result >> 63) & 1 == 1;
+                let z = result == 0;
+                let mut cpsr = self.regs.cpsr;
+                cpsr = (cpsr & !(1 << 31)) | ((n as u32) << 31);
+                cpsr = (cpsr & !(1 << 30)) | ((z as u32) << 30);
+                self.regs.cpsr = cpsr;
+            }
+        } else {
+            // Short multiply: MUL / MLA
+            let accumulate = (instr >> 21) & 1 == 1;
+            let rd = ((instr >> 16) & 0xF) as usize;
+            let rn = ((instr >> 12) & 0xF) as usize;
+
+            let result = if accumulate {
+                let rn_val = self.regs.read(rn);
+                rm_val.wrapping_mul(rs_val).wrapping_add(rn_val)
+            } else {
+                rm_val.wrapping_mul(rs_val)
+            };
+
+            self.regs.write(rd, result);
+            if set_flags {
+                self.regs.update_nz(result);
+            }
         }
     }
 

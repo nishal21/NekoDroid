@@ -157,6 +157,31 @@ pub fn wasm_memory() -> JsValue {
     wasm_bindgen::memory()
 }
 
+/// Returns a pointer to the CPU's VRAM buffer (800×600 RGBA).
+/// JS can use this with `wasm_memory()` to read pixel data directly.
+#[wasm_bindgen]
+pub fn get_vram_ptr() -> u32 {
+    ARM_CPU.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(cpu) => cpu.mmu.vram_ptr() as u32,
+            None => 0,
+        }
+    })
+}
+
+/// Returns the VRAM buffer length in bytes (1,920,000 for 800×600 RGBA).
+#[wasm_bindgen]
+pub fn get_vram_len() -> u32 {
+    ARM_CPU.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(cpu) => cpu.mmu.vram_len() as u32,
+            None => 0,
+        }
+    })
+}
+
 // ── Persistent ARM CPU ────────────────────────────────────────────────
 // Wasm is single-threaded, so thread_local + RefCell is safe.
 
@@ -297,17 +322,60 @@ pub fn get_cycle_count() -> u32 {
 /// Receives a touch/mouse event from the browser.
 /// `x` and `y` are canvas-relative pixel coordinates.
 /// `is_down` is true for press/move-while-pressed, false for release.
+/// Writes directly to the CPU's MMIO input registers.
 #[wasm_bindgen]
 pub fn send_touch_event(x: i32, y: i32, is_down: bool) {
-    let action = if is_down { "DOWN" } else { "UP" };
-    log(&format!("👆 Touch {}: ({}, {})", action, x, y));
+    ARM_CPU.with(|cell| {
+        if let Some(cpu) = cell.borrow_mut().as_mut() {
+            cpu.mmu.touch_down = is_down;
+            // Only update coordinates if it's a valid touch inside the canvas
+            if x >= 0 && y >= 0 {
+                cpu.mmu.touch_x = x as u16;
+                cpu.mmu.touch_y = y as u16;
+            }
+        }
+    });
 }
 
 /// Receives a keyboard event from the browser.
 /// `keycode` is the DOM KeyboardEvent.keyCode value.
+/// `is_down` is true for keydown, false for keyup.
+/// Writes directly to the CPU's MMIO key register.
 #[wasm_bindgen]
-pub fn send_key_event(keycode: i32) {
-    log(&format!("⌨️ Key pressed: keycode={}", keycode));
+pub fn send_key_event(keycode: i32, is_down: bool) {
+    ARM_CPU.with(|cell| {
+        if let Some(cpu) = cell.borrow_mut().as_mut() {
+            cpu.mmu.key_state = if is_down { keycode as u32 } else { 0 };
+        }
+    });
+}
+
+/// Increments the system timer by 1 (called once per animation frame, ~60 Hz).
+/// ARM programs can read SYS_TIMER at 0x10000014 for timing/VSYNC.
+#[wasm_bindgen]
+pub fn tick_sys_timer() {
+    ARM_CPU.with(|cell| {
+        if let Some(cpu) = cell.borrow_mut().as_mut() {
+            cpu.mmu.sys_timer = cpu.mmu.sys_timer.wrapping_add(1);
+        }
+    });
+}
+
+/// Returns the current AUDIO_CTRL register value.
+/// Bit 0 = enable, Bits 1-2 = waveform (0=Square, 1=Sine, 2=Sawtooth, 3=Triangle).
+#[wasm_bindgen]
+pub fn get_audio_ctrl() -> u32 {
+    ARM_CPU.with(|cell| {
+        cell.borrow().as_ref().map_or(0, |cpu| cpu.mmu.audio_ctrl)
+    })
+}
+
+/// Returns the current AUDIO_FREQ register value (frequency in Hz).
+#[wasm_bindgen]
+pub fn get_audio_freq() -> u32 {
+    ARM_CPU.with(|cell| {
+        cell.borrow().as_ref().map_or(0, |cpu| cpu.mmu.audio_freq)
+    })
 }
 
 /// Parses a hex string (e.g. "e3a00005 e3a0100a") and loads it as ARM machine code

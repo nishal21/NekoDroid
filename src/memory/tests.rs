@@ -80,3 +80,138 @@
         mmu.write_u32(0x1000_0000, 0x41); // 0x41 = 'A'
         assert_eq!(mmu.uart_buffer(), "A");
     }
+
+    // ── VRAM ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_vram_write_read_pixel() {
+        let mut mmu = Mmu::new(256);
+        // Write an RGBA pixel (0xAABBGGRR in LE → R,G,B,A bytes)
+        let vram_base: u32 = 0x0400_0000;
+        mmu.write_u32(vram_base, 0xFF0000FF); // Red pixel: R=0xFF, G=0x00, B=0x00, A=0xFF
+        assert_eq!(mmu.read_u32(vram_base), 0xFF0000FF);
+        assert_eq!(mmu.read_u8(vram_base), 0xFF);     // R
+        assert_eq!(mmu.read_u8(vram_base + 1), 0x00); // G
+        assert_eq!(mmu.read_u8(vram_base + 2), 0x00); // B
+        assert_eq!(mmu.read_u8(vram_base + 3), 0xFF); // A
+    }
+
+    #[test]
+    fn test_vram_does_not_write_ram() {
+        let mut mmu = Mmu::new(0x0500_0000); // large enough to cover VRAM range
+        let vram_base: u32 = 0x0400_0000;
+        mmu.write_u32(vram_base, 0xDEADBEEF);
+        // VRAM writes should be intercepted by the VRAM buffer, not stored in RAM
+        // Reading via the raw ram vector should still be 0
+        let ram_offset = vram_base as usize;
+        assert_eq!(mmu.ram[ram_offset], 0);
+        // But reading through MMU should return the VRAM value
+        assert_eq!(mmu.read_u32(vram_base), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_vram_pixel_at_offset() {
+        let mut mmu = Mmu::new(256);
+        let vram_base: u32 = 0x0400_0000;
+        // Pixel at (100, 50): offset = (50 * 800 + 100) * 4 = 160,400
+        let pixel_addr = vram_base + (50 * 800 + 100) * 4;
+        mmu.write_u32(pixel_addr, 0xFF00FF00); // Green pixel
+        assert_eq!(mmu.read_u32(pixel_addr), 0xFF00FF00);
+    }
+
+    #[test]
+    fn test_vram_clear_on_reset() {
+        let mut mmu = Mmu::new(256);
+        let vram_base: u32 = 0x0400_0000;
+        mmu.write_u32(vram_base, 0xFFFFFFFF);
+        assert_eq!(mmu.read_u32(vram_base), 0xFFFFFFFF);
+        mmu.clear_vram();
+        // After clear: R=0, G=0, B=0, A=255 → 0xFF000000
+        assert_eq!(mmu.read_u32(vram_base), 0xFF000000);
+    }
+
+    // ── Input MMIO ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_input_key_register() {
+        let mut mmu = Mmu::new(256);
+        assert_eq!(mmu.read_u32(0x1000_0008), 0); // no key pressed
+        mmu.key_state = 65; // 'A' keycode
+        assert_eq!(mmu.read_u32(0x1000_0008), 65);
+        mmu.key_state = 0; // released
+        assert_eq!(mmu.read_u32(0x1000_0008), 0);
+    }
+
+    #[test]
+    fn test_input_touch_register() {
+        let mut mmu = Mmu::new(256);
+        assert_eq!(mmu.read_u32(0x1000_000C), 0); // not touching
+        mmu.touch_down = true;
+        assert_eq!(mmu.read_u32(0x1000_000C), 1);
+        mmu.touch_down = false;
+        assert_eq!(mmu.read_u32(0x1000_000C), 0);
+    }
+
+    #[test]
+    fn test_input_coord_register() {
+        let mut mmu = Mmu::new(256);
+        mmu.touch_x = 400;
+        mmu.touch_y = 300;
+        let coord = mmu.read_u32(0x1000_0010);
+        assert_eq!(coord & 0xFFFF, 400);         // X in low 16 bits
+        assert_eq!((coord >> 16) & 0xFFFF, 300);  // Y in high 16 bits
+    }
+
+    #[test]
+    fn test_sys_timer_register() {
+        let mut mmu = Mmu::new(256);
+        assert_eq!(mmu.read_u32(0x1000_0014), 0);
+        mmu.sys_timer = 42;
+        assert_eq!(mmu.read_u32(0x1000_0014), 42);
+    }
+
+    #[test]
+    fn test_input_registers_not_writable() {
+        let mut mmu = Mmu::new(0x2000_0000);
+        // Writing to input registers should be ignored
+        mmu.write_u32(0x1000_0008, 0xDEAD);
+        mmu.write_u32(0x1000_000C, 0xBEEF);
+        mmu.write_u32(0x1000_0010, 0xFACE);
+        mmu.write_u32(0x1000_0014, 0xCAFE);
+        // All should still be 0 (only the host can set them externally)
+        assert_eq!(mmu.key_state, 0);
+        assert_eq!(mmu.touch_down, false);
+        assert_eq!(mmu.sys_timer, 0);
+    }
+
+    // ── Audio MMIO ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_audio_registers_read_write() {
+        let mut mmu = Mmu::new(256);
+
+        // Initially zero
+        assert_eq!(mmu.read_u32(0x1000_0018), 0); // AUDIO_CTRL
+        assert_eq!(mmu.read_u32(0x1000_001C), 0); // AUDIO_FREQ
+
+        // CPU writes AUDIO_CTRL: enable + sine waveform (bit0=1, bits1-2=01 → 0x03)
+        mmu.write_u32(0x1000_0018, 0x03);
+        assert_eq!(mmu.audio_ctrl, 0x03);
+        assert_eq!(mmu.read_u32(0x1000_0018), 0x03);
+
+        // CPU writes AUDIO_FREQ: 440 Hz
+        mmu.write_u32(0x1000_001C, 440);
+        assert_eq!(mmu.audio_freq, 440);
+        assert_eq!(mmu.read_u32(0x1000_001C), 440);
+
+        // Overwrite with new values
+        mmu.write_u32(0x1000_0018, 0x05); // enable + sawtooth (bits1-2=10)
+        mmu.write_u32(0x1000_001C, 880);
+        assert_eq!(mmu.audio_ctrl, 0x05);
+        assert_eq!(mmu.audio_freq, 880);
+
+        // Disable audio (write 0)
+        mmu.write_u32(0x1000_0018, 0);
+        assert_eq!(mmu.audio_ctrl, 0);
+        assert_eq!(mmu.read_u32(0x1000_0018), 0);
+    }

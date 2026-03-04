@@ -789,3 +789,316 @@ GCC-compiled `main.c` (UART hello world) printed "**HI**ello from Bare-Metal C�
 - **Live ROM test** — `program.bin` (216 bytes) loaded and executed:
   - `📟 UART: Hello from Bare-Metal C running on NekoDroid!` ✅
   - `📟 UART: If you are reading this, your ARM CPU is fully functional.` ✅
+
+---
+
+## Session 34 — VRAM Framebuffer (CPU→Canvas Pipeline)
+
+### Goal
+Hand control of the 800×600 `<canvas>` over to compiled C programs by adding a dedicated Video RAM (VRAM) region to the Memory-Mapped I/O system. ARM programs can now draw pixels to the browser screen simply by writing to memory addresses.
+
+### MMIO Map
+| Region | Address Range | Size | Purpose |
+|--------|--------------|------|---------|
+| **VRAM** | `0x04000000`–`0x041D4BFF` | 1,920,000 bytes | 800×600 RGBA framebuffer |
+| UART TX | `0x10000000` | 1 byte | Serial output |
+| UART RX | `0x10000004` | 1 byte | Serial input (stub) |
+
+### Architecture
+```
+ARM Program → STR to 0x04000000+ → Mmu.vram[] → wasm_memory() → TypeScript ImageData → Canvas
+```
+
+The VRAM buffer lives inside the `Mmu` struct as a `Vec<u8>` (1,920,000 bytes). When the CPU executes a store instruction targeting `0x04000000`–`0x041D4BFF`, the write goes to `vram[]` instead of `ram[]`. The TypeScript render loop reads the VRAM pointer via `get_vram_ptr()` and creates an `ImageData` directly from Wasm linear memory — zero-copy.
+
+### Changes
+
+**`src/memory.rs`**
+- Added VRAM constants: `VRAM_BASE (0x04000000)`, `VRAM_END`, `VRAM_SIZE`, `VRAM_WIDTH`, `VRAM_HEIGHT`
+- Added `vram: Vec<u8>` field to `Mmu` struct (initialized to black with full alpha)
+- Added `is_vram()` detection in all `read_u8/u16/u32` and `write_u8/u16/u32` methods
+- Added fast-path for aligned 32-bit VRAM read/write (avoids 4× byte dispatch)
+- Added `vram_ptr()`, `vram_len()`, `clear_vram()` accessor methods
+- `clear_vram()` resets all pixels to black (R=0, G=0, B=0, A=255)
+
+**`src/cpu.rs`**
+- `reset()` now calls `self.mmu.clear_vram()` alongside `clear_uart_buffer()`
+
+**`src/lib.rs`**
+- Added `get_vram_ptr() -> u32` wasm export (returns pointer to CPU's VRAM buffer)
+- Added `get_vram_len() -> u32` wasm export (returns 1,920,000)
+
+**`src/main.ts`**
+- Added `'vram'` to `RenderMode` type union
+- Added 🖥️ VRAM button to the controls bar
+- Render loop: `'vram'` mode skips VirtualCPU render calls — reads directly from `get_vram_ptr()`
+- ROM upload auto-switches to VRAM render mode on successful load
+- Imported `get_vram_ptr` and `get_vram_len` from wasm module
+
+**`src/memory/tests.rs`** — 4 new tests:
+- `test_vram_write_read_pixel` — write/read RGBA pixel at base address
+- `test_vram_does_not_write_ram` — VRAM writes don't leak to RAM
+- `test_vram_pixel_at_offset` — pixel at (100, 50) via calculated offset
+- `test_vram_clear_on_reset` — clear_vram resets to black with full alpha
+
+**`vram_test.c`** — Bare-metal C test program:
+- Draws three colored squares (red, green, blue) at different positions
+- Prints "VRAM test complete" via UART
+- Compiled to `vram_test.bin` (412 bytes)
+
+### Pixel Format
+Each pixel is 4 bytes in RGBA order (little-endian `u32`):
+- `0xFF0000FF` → Red (R=0xFF, G=0x00, B=0x00, A=0xFF)
+- `0xFF00FF00` → Green
+- `0xFFFF0000` → Blue
+
+C programs write: `VRAM[y * 800 + x] = color;`
+
+### Verification
+- `cargo test` — **65 passed, 0 failed, 0 ignored** ✅
+- `wasm-pack build --target web` — ✅
+- TypeScript: **0 errors** ✅
+- `vram_test.bin` compiled (412 bytes, `_start` at 0x8000) ✅
+- **Live VRAM test** — `vram_test.bin` loaded and executed:
+  - Three colored squares (red, green, blue) rendered on canvas ✅
+  - `📟 UART: VRAM test complete: RGB squares drawn!` ✅
+- Added ▶ Run / ⏹ Stop toggle button (50,000 instructions/frame) for continuous execution
+
+---
+
+## Session 35 — Input MMIO & System Timer
+
+### Goal
+Expand the MMIO peripheral system to support hardware input (keyboard/touch) and a system timer, allowing ARM programs to read user input and track time via memory-mapped registers.
+
+### MMIO Register Map (Updated)
+| Address | Name | R/W | Description |
+|---------|------|-----|-------------|
+| `0x10000000` | UART_TX | W | Transmit byte to serial console |
+| `0x10000004` | UART_RX | R | Receive byte (stub, returns 0) |
+| `0x10000008` | INPUT_KEY | R | Currently pressed keycode (0 = none) |
+| `0x1000000C` | INPUT_TOUCH | R | 1 if touching/clicking, 0 if not |
+| `0x10000010` | INPUT_COORD | R | Touch coordinates: `[Y:16][X:16]` |
+| `0x10000014` | SYS_TIMER | R | Frame counter (~60 Hz VSYNC) |
+
+All input/timer registers are **read-only from the CPU** — writes to `0x10000008`–`0x10000017` are silently ignored. The host (TypeScript) sets them via wasm exports.
+
+### Architecture
+```
+Browser keydown/keyup → send_key_event(keycode, is_down) → cpu.mmu.key_state
+Browser mouse events  → send_touch_event(x, y, is_down) → cpu.mmu.touch_down/x/y
+requestAnimationFrame → tick_sys_timer()                 → cpu.mmu.sys_timer++
+ARM program           → LDR R0, [0x10000008]             → reads key_state
+```
+
+### Changes
+
+**`src/memory.rs`**
+- Added MMIO constants: `INPUT_KEY`, `INPUT_TOUCH`, `INPUT_COORD`, `SYS_TIMER`, `PERIPH_END`
+- Added fields to `Mmu`: `key_state: u32`, `touch_down: bool`, `touch_x: u16`, `touch_y: u16`, `sys_timer: u32`
+- Widened `is_uart()` range to cover `0x10000000`–`0x10000017` (full peripheral block)
+- Added `read_periph_u32()` dispatcher that returns the correct register value by address
+- Updated `read_u8()` to extract individual bytes from peripheral registers via aligned read
+- All peripheral registers protected from CPU writes (only UART_TX is writable)
+
+**`src/lib.rs`**
+- `send_touch_event()` now writes directly to `cpu.mmu.touch_down/touch_x/touch_y`
+- `send_key_event(keycode, is_down)` now accepts `is_down` parameter, writes to `cpu.mmu.key_state`
+- Added `tick_sys_timer()` export — increments `cpu.mmu.sys_timer` (wrapping)
+
+**`src/main.ts`**
+- Imported `tick_sys_timer` from wasm module
+- `keydown` listener now calls `send_key_event(keyCode, true)`
+- Added `keyup` listener calling `send_key_event(keyCode, false)`
+- Frame loop calls `tick_sys_timer()` once per `requestAnimationFrame`
+
+**`src/memory/tests.rs`** — 5 new tests:
+- `test_input_key_register` — keycode read/clear
+- `test_input_touch_register` — touch state read
+- `test_input_coord_register` — packed [Y:16][X:16] coordinate read
+- `test_sys_timer_register` — timer value read
+- `test_input_registers_not_writable` — CPU writes to input regs are ignored
+
+### C Usage Example
+```c
+volatile unsigned int * const INPUT_KEY   = (unsigned int *)0x10000008;
+volatile unsigned int * const INPUT_TOUCH = (unsigned int *)0x1000000C;
+volatile unsigned int * const INPUT_COORD = (unsigned int *)0x10000010;
+volatile unsigned int * const SYS_TIMER   = (unsigned int *)0x10000014;
+
+unsigned int key   = *INPUT_KEY;        // current keycode
+unsigned int down  = *INPUT_TOUCH;      // 1 if touching
+unsigned int coord = *INPUT_COORD;      // [Y:16][X:16]
+unsigned int x     = coord & 0xFFFF;
+unsigned int y     = (coord >> 16) & 0xFFFF;
+unsigned int frame = *SYS_TIMER;        // frame counter
+```
+
+### Verification
+- `cargo test` — **70 passed, 0 failed, 0 ignored** ✅
+- `wasm-pack build --target web` — ✅
+- TypeScript: **0 errors** ✅
+
+---
+
+## Session 36 — UMULL/SMULL, Entry Point Fix & Touch Timing
+**Date:** 2026-03-04  
+**Role:** CPU Debugger / Systems Programmer
+
+### Goal
+Debug three critical issues preventing `input_test.c` from running correctly: cyan screen fill, blank screen after `-O2` compile, and missed touch events.
+
+### Bug 1: Missing Long Multiply Instructions (Cyan Screen)
+GCC `-O2` compiles `timer % 200` using a reciprocal multiply:
+```asm
+umull r2, r3, sl, r3    @ 64-bit unsigned multiply
+```
+The old dispatch mask `0x0FC000F0` only caught MUL/MLA (bit23=0). UMULL has bit23=1, so it fell through to the halfword transfer handler, corrupting registers and filling the screen cyan.
+
+**Fix:** Widened dispatch mask to `0x0F0000F0` and implemented all four long multiply variants:
+- **UMULL** — unsigned multiply long (RdHi:RdLo = Rm × Rs)
+- **SMULL** — signed multiply long
+- **UMLAL** — unsigned multiply-accumulate long
+- **SMLAL** — signed multiply-accumulate long
+
+Also fixed an **inverted U-bit polarity** bug: ARM defines bit22=0 as unsigned, bit22=1 as signed. Initial implementation had it backwards. Tests had matching inverted encodings so they passed despite the bug.
+
+### Bug 2: GCC `-O2` Function Reordering (Blank Screen)
+With `-O2`, GCC placed `draw_pixel` at 0x8000 instead of `_start` (which ended up at 0x8378). The CPU started executing `draw_pixel`'s bounds-check code instead of the program entry point.
+
+**Fix:** Created `start.S` — an assembly boot stub:
+```asm
+.section .text.boot, "ax"
+.global _boot
+_boot:
+    b _start
+```
+Listed first in the gcc command so `_boot` (containing `b _start`) is always at 0x8000.
+
+### Bug 3: Touch Events Lost Between Frames
+`mousedown` and `mouseup` could both fire between animation frames, so the CPU never saw `touch_down=true`.
+
+**Fix:** Deferred touch release — `mouseup` stores coordinates in `pendingRelease`, which is processed AFTER the batch execution in the next frame. This guarantees the CPU sees `touch_down=true` for at least one full frame of 500K instructions.
+
+### Changes
+
+**`src/cpu.rs`**
+- Widened multiply dispatch mask from `0x0FC000F0` to `0x0F0000F0`
+- Implemented UMULL/SMULL/UMLAL/SMLAL in `execute_multiply()`
+- Fixed U-bit polarity: `signed = (instr >> 22) & 1 == 1`
+- Updated disassembly table for long multiply mnemonics
+
+**`src/main.ts`**
+- BATCH_SIZE increased from 50K to 500K instructions/frame
+- Added deferred touch release (`pendingRelease` pattern)
+- Release processed after batch execution, before frame render
+
+**`start.S`** (NEW)
+- Assembly boot stub ensuring `b _start` is always at 0x8000
+
+**`src/cpu/tests.rs`** — 5 new tests:
+- `test_umull` / `test_umull_simple` / `test_smull` / `test_umlal`
+- `test_umull_modulo_200` — integration test reproducing GCC's `timer%200` sequence
+
+### Verification
+- `cargo test` — **75 passed, 0 failed** ✅
+- `input_test.bin` — UART prints "Input MMIO test v2 starting...", "UI drawn. Entering main loop...", "Touch UP" ✅
+- Boot stub verified: `_boot` at 0x8000 → `ea0000dd b 837c <_start>` ✅
+
+---
+
+## Session 37 — Audio Processing Unit (APU) MMIO
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer
+
+### Goal
+Add writable MMIO registers for an Audio Processing Unit, allowing ARM programs to control sound generation.
+
+### MMIO Register Map (Updated)
+| Address | Name | R/W | Description |
+|---------|------|-----|-------------|
+| `0x10000000` | UART_TX | W | Transmit byte to serial console |
+| `0x10000004` | UART_RX | R | Receive byte (stub, returns 0) |
+| `0x10000008` | INPUT_KEY | R | Currently pressed keycode (0 = none) |
+| `0x1000000C` | INPUT_TOUCH | R | 1 if touching/clicking, 0 if not |
+| `0x10000010` | INPUT_COORD | R | Touch coordinates: `[Y:16][X:16]` |
+| `0x10000014` | SYS_TIMER | R | Frame counter (~60 Hz VSYNC) |
+| `0x10000018` | AUDIO_CTRL | R/W | Bit 0=Enable, Bits 1-2=Waveform (0=Square,1=Sine,2=Saw,3=Tri) |
+| `0x1000001C` | AUDIO_FREQ | R/W | Frequency in Hz |
+
+### Key Design Decision
+Unlike the input registers (read-only from CPU), the audio registers are **writable by the CPU**. The write interception logic in `write_u8`/`write_u16`/`write_u32` checks for `AUDIO_CTRL`/`AUDIO_FREQ` before the generic "ignore peripheral writes" fallthrough.
+
+### Changes
+
+**`src/memory.rs`**
+- Added constants: `AUDIO_CTRL` (0x10000018), `AUDIO_FREQ` (0x1000001C)
+- Updated `PERIPH_END` to `0x10000020`
+- Added fields: `audio_ctrl: u32`, `audio_freq: u32` (initialized to 0)
+- `read_periph_u32()` returns `audio_ctrl`/`audio_freq` for their addresses
+- `write_u8`/`write_u16`/`write_u32` intercept writes to audio registers
+
+**`src/lib.rs`**
+- `get_audio_ctrl()` — wasm export returning `cpu.mmu.audio_ctrl`
+- `get_audio_freq()` — wasm export returning `cpu.mmu.audio_freq`
+
+**`src/memory/tests.rs`**
+- `test_audio_registers_read_write` — covers init, write, read-back, overwrite, disable
+
+### Verification
+- `cargo test` — **76 passed, 0 failed** ✅
+- `wasm-pack build` — ✅
+
+---
+
+## Session 38 — Web Audio Integration & Theremin Demo
+**Date:** 2026-03-04  
+**Role:** Frontend UI Engineer
+
+### Goal
+Hook the CPU's audio MMIO state into the browser's Web Audio API to produce real sound, then build a touch-controlled synthesizer demo.
+
+### Architecture
+```
+ARM program writes AUDIO_CTRL/AUDIO_FREQ
+    ↓
+get_audio_ctrl() / get_audio_freq() — wasm exports
+    ↓
+60 FPS render loop reads registers
+    ↓
+Web Audio API: OscillatorNode.type + frequency.setTargetAtTime()
+    ↓
+Speaker output 🔊
+```
+
+### Changes
+
+**`src/main.ts`**
+- Imported `get_audio_ctrl`, `get_audio_freq` from wasm
+- Audio state variables: `audioCtx`, `oscillator`, `gainNode`, `isAudioInitialized`
+- `WAVEFORMS` array: `['square', 'sine', 'sawtooth', 'triangle']`
+- `initAudio()` — creates AudioContext + OscillatorNode on first mousedown (browser autoplay unlock)
+- Render loop audio sync: reads `AUDIO_CTRL` bit 0 for enable, bits 1-2 for waveform, `AUDIO_FREQ` for Hz
+- Uses `setTargetAtTime(freq, currentTime, 0.015)` for smooth frequency transitions (no popping)
+- Suspends/resumes `AudioContext` based on enable bit
+
+**`theremin.c`** (NEW) — Touch-controlled synthesizer:
+- Touch on canvas → X axis maps to frequency (100–900 Hz), Y axis maps to waveform (square/sine/saw/tri)
+- Release → disables audio
+- 108 bytes compiled binary
+- GCC uses UMULL for `y / 150` division (confirming long multiply works)
+
+### C Usage Example
+```c
+volatile unsigned int * const AUDIO_CTRL = (unsigned int *)0x10000018;
+volatile unsigned int * const AUDIO_FREQ = (unsigned int *)0x1000001C;
+
+*AUDIO_FREQ = 440;                    // A4 note
+*AUDIO_CTRL = 1 | (1 << 1);           // Enable + sine waveform
+*AUDIO_CTRL = 0;                      // Silence
+```
+
+### Verification
+- TypeScript: **0 errors** ✅
+- `theremin.bin` — 108 bytes, `_boot` at 0x8000 → `b _start` at 0x8004 ✅
+- **Live test: sound confirmed working in browser** 🔊 ✅
