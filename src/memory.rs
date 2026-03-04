@@ -79,6 +79,11 @@ impl Mmu {
         &self.uart_tx_buffer
     }
 
+    /// Clears the UART TX buffer (used on CPU reset).
+    pub fn clear_uart_buffer(&mut self) {
+        self.uart_tx_buffer.clear();
+    }
+
     // ── Read operations (little-endian) ───────────────────────────────
 
     /// Reads a single byte from the given address.
@@ -185,88 +190,4 @@ impl Mmu {
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_read_write_u8() {
-        let mut mmu = Mmu::new(1024);
-        mmu.write_u8(0x10, 0xAB);
-        assert_eq!(mmu.read_u8(0x10), 0xAB);
-    }
-
-    #[test]
-    fn test_read_write_u16_little_endian() {
-        let mut mmu = Mmu::new(1024);
-        mmu.write_u16(0x20, 0xBEEF);
-        assert_eq!(mmu.read_u8(0x20), 0xEF);
-        assert_eq!(mmu.read_u8(0x21), 0xBE);
-        assert_eq!(mmu.read_u16(0x20), 0xBEEF);
-    }
-
-    #[test]
-    fn test_read_write_u32_little_endian() {
-        let mut mmu = Mmu::new(1024);
-        mmu.write_u32(0x30, 0xDEADBEEF);
-        assert_eq!(mmu.read_u8(0x30), 0xEF);
-        assert_eq!(mmu.read_u8(0x31), 0xBE);
-        assert_eq!(mmu.read_u8(0x32), 0xAD);
-        assert_eq!(mmu.read_u8(0x33), 0xDE);
-        assert_eq!(mmu.read_u32(0x30), 0xDEADBEEF);
-    }
-
-    #[test]
-    fn test_out_of_bounds_reads_zero() {
-        let mmu = Mmu::new(64);
-        assert_eq!(mmu.read_u8(100), 0);
-        assert_eq!(mmu.read_u32(100), 0);
-    }
-
-    #[test]
-    fn test_load_bytes() {
-        let mut mmu = Mmu::new(1024);
-        let program = [0x01, 0x02, 0x03, 0x04];
-        mmu.load_bytes(0x100, &program);
-        assert_eq!(mmu.read_u32(0x100), 0x04030201); // little-endian
-    }
-
-    // ── MMIO / UART tests ─────────────────────────────────────────────
-
-    #[test]
-    fn test_uart_tx_buffer() {
-        let mut mmu = Mmu::new(1024);
-
-        // Write 'H', 'i' to UART TX
-        mmu.write_u8(0x1000_0000, b'H');
-        mmu.write_u8(0x1000_0000, b'i');
-        assert_eq!(mmu.uart_buffer(), "Hi");
-
-        // Newline flushes the buffer
-        mmu.write_u8(0x1000_0000, b'\n');
-        assert_eq!(mmu.uart_buffer(), "");
-    }
-
-    #[test]
-    fn test_uart_tx_does_not_write_ram() {
-        let mut mmu = Mmu::new(1024);
-        mmu.write_u8(0x1000_0000, b'X');
-        // UART address should NOT be written to RAM
-        // (it's way beyond 1024 bytes anyway, but the point is interception)
-        assert_eq!(mmu.uart_buffer(), "X");
-    }
-
-    #[test]
-    fn test_uart_rx_returns_zero() {
-        let mmu = Mmu::new(1024);
-        assert_eq!(mmu.read_u8(0x1000_0004), 0);
-        assert_eq!(mmu.read_u32(0x1000_0004), 0);
-    }
-
-    #[test]
-    fn test_uart_write_u32_only_sends_low_byte() {
-        let mut mmu = Mmu::new(1024);
-        // Writing 0x00000041 ('A') via write_u32 to UART TX
-        mmu.write_u32(0x1000_0000, 0x41);
-        assert_eq!(mmu.uart_buffer(), "A");
-    }
-}
+mod tests;

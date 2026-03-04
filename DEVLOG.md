@@ -355,16 +355,437 @@
 
 ---
 
+## Session 17: Test Extraction & Module Restructure
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer
+
+### What We Did
+- **Problem:** `src/cpu.rs` had grown to 1,931 lines with ~750 lines of embedded tests at the bottom, hurting readability.
+- **Created `src/cpu/tests.rs`** — Extracted the entire contents of the `#[cfg(test)] mod tests { ... }` block (all `use super::*;`, helpers, and 36 test functions) into a dedicated file.
+- **Updated `src/cpu.rs`** — Replaced the ~750-line inline test block with a two-line module declaration:
+  ```rust
+  #[cfg(test)]
+  mod tests;
+  ```
+- **Why not `tests/` directory?** An external `tests/` directory creates integration tests that compile as a separate crate, which breaks our `cdylib` WebAssembly target. Using `mod tests;` inside the source tree keeps them as unit tests with full `pub(crate)` access.
+
+### Verification
+- `cargo test` — **36 passed, 0 failed, 0 ignored** ✅
+- All test paths correctly resolve as `cpu::tests::*`
+- No compilation warnings related to the restructure
+
+---
+
+## Session 18: Thumb Instruction Set — Fetch & Decode Scaffold
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Task 1 — Fetch Stage:** Verified `fetch()` already reads a `u16` (via `mmu.read_u16`) when in Thumb mode, and `advance_pc()` already adds 2 in Thumb mode / 4 in ARM mode. No changes needed — pipeline handling was correct from Session 5.
+- **Task 2 — Thumb Dispatch in `step()`:** Added a Thumb-mode early-exit path between FETCH and CONDITION CHECK. When `self.regs.is_thumb()` is true, the instruction is cast to `u16` and dispatched to the new `execute_thumb_instruction()` method, bypassing the ARM condition code check and 32-bit decode entirely.
+- **Task 3 — Decode Stub:** Created `execute_thumb_instruction(&mut self, instr: u16, pc_at_fetch: u32)` with a `match instr >> 10` (top 6 bits) dispatch table. Currently has a catch-all `_` arm that calls `log_unimplemented("Thumb", ...)` — ready for opcode handlers in the next session.
+
+### Key Design Notes
+- **Thumb pipeline offset:** In Thumb mode, `PC` reads as `current_instruction + 4` (not `+8` like ARM). This matters for PC-relative loads and branches that will be implemented next.
+- **No condition codes in Thumb:** Most Thumb instructions are unconditional (only conditional branches use conditions), so we skip `check_condition()` entirely in the Thumb path.
+
+### Verification
+- `cargo test` — **36 passed, 0 failed, 0 ignored** ✅
+- All existing ARM tests unaffected by the new Thumb dispatch path
+
+---
+
+## Session 19: Project Reference Document
+**Date:** 2026-03-03  
+**Role:** Technical Writer / Documentation Architect
+
+### What We Built
+- **`PROJECT_REFERENCE.md`** — a comprehensive, self-contained document designed so any AI (or human) can fully understand the nekodroid project without reading every source file.
+- Covers: tech stack, directory structure, architecture diagram, all data structures (`RegisterFile`, `Cpu`, `Mmu`, `VirtualCPU`), complete ARM instruction set status, Wasm export table, frontend UI breakdown, memory map, test suite inventory, known issues, development workflow, DEVLOG format, key design decisions, and step-by-step guides for extending the emulator (ARM/Thumb instructions, MMIO peripherals, Wasm exports).
+
+### Purpose
+- Acts as a onboarding brief for any AI assistant picking up the project mid-stream.
+- Eliminates the need to read all 18 DEVLOG sessions + all source files to get up to speed.
+
+---
+
+## Session 20: Thumb ALU — AND Operation
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Thumb Data Processing arm** — Added `0b010000` match arm in `execute_thumb_instruction()` for Thumb ALU operations.
+- **AND (opcode 0x0):** Extracts `op` bits [9:6], `Rm` bits [5:3], `Rd/Rdn` bits [2:0]. Computes `Rd = Rd AND Rm`, updates N and Z flags.
+- Remaining ALU sub-ops (EOR, LSL, LSR, ASR, ADC, SBC, ROR, TST, NEG, CMP, CMN, ORR, MUL, BIC, MVN) fall through to `log_unimplemented("Thumb ALU", ...)` — ready for future implementation.
+
+### Verification
+- `cargo test` — **36 passed, 0 failed, 0 ignored** ✅ (no new tests added; confirmed compilation and no regressions)
+
+---
+
+## Session 21: Memory Test Restoration
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / Test Engineer
+
+### What We Built
+- **Problem:** During the Session 17 test refactoring, 9 crucial MMU/UART tests (originally from Sessions 5 and 13) were lost. The DEVLOG referenced them but they no longer existed in the codebase.
+- **Created `src/memory/tests.rs`** — Dedicated test file for the Memory Management Unit, following the same `mod tests;` pattern used for CPU tests.
+- **Linked in `src/memory.rs`** — Added `#[cfg(test)] mod tests;` at the bottom.
+
+### Tests (9 new, 45 total — all pass)
+**Basic Read/Write (Little-Endian):**
+- `test_read_write_u8` — Write 0xAB to addr 0x10, verify readback ✅
+- `test_read_write_u16_little_endian` — Write 0xBEEF, verify byte order (0xEF, 0xBE) ✅
+- `test_read_write_u32_little_endian` — Write 0xDEADBEEF, verify all 4 bytes in LE order ✅
+- `test_out_of_bounds_reads_zero` — Read past RAM size returns 0, no panic ✅
+- `test_load_bytes` — Bulk load [0x01,0x02,0x03,0x04], verify read_u32 = 0x04030201 ✅
+
+**MMIO / UART:**
+- `test_uart_tx_buffer` — Write 'H','i' to 0x10000000 → buffer = "Hi", newline clears ✅
+- `test_uart_tx_does_not_write_ram` — UART writes don't touch underlying RAM ✅
+- `test_uart_rx_returns_zero` — UART RX (0x10000004) returns 0 (stub) ✅
+- `test_uart_write_u32_only_sends_low_byte` — write_u32(0x41) → buffer = "A" ✅
+
+### Verification
+- `cargo test` — **45 passed, 0 failed, 0 ignored** ✅
+- DEVLOG test count discrepancy from Sessions 5/13 is now resolved
+
+---
+
+## Session 22: Thumb ALU Completion & Unconditional Branch
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Completed Thumb Data Processing (Format 5)** — Filled in the `0b010000` match arm with all core ALU operations:
+  - **0x0 AND**, **0x1 EOR**, **0x2 LSL**, **0x3 LSR**, **0x4 ASR** — register-register operations using `shift_operand()` for shifts, result stored to Rd, N/Z flags updated.
+  - **0x8 TST** — AND with flags only (result discarded, Rd unchanged).
+  - **0xA CMP** — SUB with flags only: N/Z from result, C flag = no-borrow (`rd >= rm`), V flag = signed overflow (same logic as ARM CMP).
+  - **0xC ORR**, **0xF MVN** — bitwise OR and bitwise NOT.
+- **Thumb Unconditional Branch (Format 18)** — Added `0b111000 | 0b111001` match arm (top 5 bits = `11100`, with bit 10 as part of the 11-bit offset):
+  - 11-bit offset sign-extended to 32 bits, shifted left by 1.
+  - Target = `pc_at_fetch + 4 + sign_extended_offset`.
+- **Bug fix:** The original task specified `0b11100` (5-bit match) but our dispatch uses `instr >> 10` (6-bit groups). Fixed to `0b111000 | 0b111001` to cover both possible bit-10 values.
+
+### Tests (8 new, 53 total — all pass)
+- `test_thumb_basic_branch` — B +0 at addr 0 → PC = 4 ✅
+- `test_thumb_branch_backward` — B -4 at addr 4 → PC = 2 ✅
+- `test_thumb_alu_and` — AND 0xFF, 0x0F = 0x0F ✅
+- `test_thumb_alu_eor` — EOR 0xFF, 0xFF = 0, Z flag set ✅
+- `test_thumb_alu_orr` — ORR 0xF0, 0x0F = 0xFF ✅
+- `test_thumb_alu_mvn` — MVN 0 = 0xFFFFFFFF, N flag set ✅
+- `test_thumb_alu_cmp` — CMP 5, 5 → Z set, C set, V clear ✅
+- `test_thumb_alu_tst` — TST 0xF0, 0x0F → Z set, R0 unchanged ✅
+
+### Verification
+- `cargo test` — **53 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 23: Thumb Format 3 — Immediate MOV/CMP/ADD/SUB
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Format 3 decode** — Added `8..=15` range match arm (top 3 bits = `001`) in `execute_thumb_instruction()`. Extracts `op` from bits [12:11], `Rd` from bits [10:8], and `imm8` from bits [7:0].
+- **MOV Rd, #imm8** (op=0) — Writes immediate to Rd, updates N/Z.
+- **CMP Rd, #imm8** (op=1) — Subtracts immediate from Rd, updates N/Z/C/V flags, result discarded.
+- **ADD Rd, #imm8** (op=2) — Adds immediate to Rd, stores result, updates N/Z/C/V. Carry = unsigned overflow (`result < rd_val`), V = signed overflow.
+- **SUB Rd, #imm8** (op=3) — Subtracts immediate from Rd, stores result, updates N/Z/C/V. Carry = no-borrow (`rd_val >= imm8`), V = signed overflow.
+
+### Tests (1 new, 54 total — all pass)
+- `test_thumb_imm_alu` — MOV R0,#10 → ADD R0,#5 (=15) → SUB R0,#2 (=13) → CMP R0,#13 (Z=true, N=false) ✅
+
+### Verification
+- `cargo test` — **54 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 24: Thumb Conditional Branch (Format 16)
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Format 16 decode** — Added `52..=55` range match arm (top 4 bits = `1101`) in `execute_thumb_instruction()`.
+- **SWI intercept** — If condition field (bits [11:8]) == `0xF`, routes to `execute_swi()` via a reconstructed 32-bit SWI instruction, since Thumb SWI shares the same encoding space.
+- **Conditional branching** — Reuses ARM `check_condition()` by placing the 4-bit condition code into bits [31:28] of a dummy instruction word. All 15 ARM conditions (EQ, NE, CS, CC, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE) work in Thumb mode.
+- **Branch offset** — 8-bit signed immediate, sign-extended to 32 bits, shifted left by 1. Target = `pc_at_fetch + 4 + offset`.
+
+### Key Design Notes
+- **Condition reuse:** Rather than duplicating the condition evaluation logic, we shift the 4-bit cond field into a dummy 32-bit word and call `check_condition()` — same code path as ARM.
+- **Thumb loops now work:** `CMP` + `BEQ`/`BNE` can implement loops and if/else in Thumb mode.
+
+### Tests (1 new, 55 total — all pass)
+- `test_thumb_cond_branch` — MOV R0,#5 → CMP R0,#5 → BEQ +2 (taken, skips MOV R1,#1) → MOV R3,#3 at target. Verifies branch taken, R3=3, R1=0 (skipped). ✅
+
+### Verification
+- `cargo test` — **55 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 25: Thumb Load/Store with Immediate Offset (Format 9)
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Format 9 decode** — Added `24..=31` range match arm (top 3 bits = `011`) in `execute_thumb_instruction()`.
+- **Bit field extraction:** B (bit 12) selects byte/word, L (bit 11) selects load/store, imm5 (bits [10:6]) is the offset, Rn (bits [5:3]) is the base register, Rd (bits [2:0]) is the source/destination.
+- **Word transfers (B=0):** Offset = `imm5 << 2` (word-aligned). LDR reads 32-bit word, STR writes 32-bit word.
+- **Byte transfers (B=1):** Offset = `imm5` (byte-aligned). LDRB reads single byte (zero-extended), STRB writes low byte.
+
+### Bug Fix
+- Initial test used incorrect Thumb encodings (`0x6108`/`0x6908`) which placed imm5=4 instead of imm5=1. Corrected to `0x6048`/`0x6848` for a 4-byte offset (`imm5=1, 1<<2=4`).
+
+### Tests (1 new, 56 total — all pass)
+- `test_thumb_ldr_str_imm` — STR R0,[R1,#4] writes 0xDEADBEEF to addr 0x204, LDR R0,[R1,#4] reads it back. ✅
+
+### Verification
+- `cargo test` — **56 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 26: Thumb PUSH/POP (Format 14)
+**Date:** 2026-03-03  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### What We Built
+- **Format 14 decode** — Added `44..=47` range match arm (top 4 bits = `1011`) in `execute_thumb_instruction()`.
+- **PUSH (L=0):** Reconstructs an ARM `STMDB SP!, {reg_list}` instruction (`0xE92D0000 | reg_list`) and delegates to `execute_block_data_transfer()`. If R-bit is set, LR (R14) is added to the register list.
+- **POP (L=1):** Reconstructs an ARM `LDMIA SP!, {reg_list}` instruction (`0xE8BD0000 | reg_list`) and delegates to `execute_block_data_transfer()`. If R-bit is set, PC (R15) is added to the register list (enabling return-from-subroutine).
+
+### Key Design Note
+- **Code reuse:** Rather than re-implementing block transfer logic, we reconstruct the equivalent 32-bit ARM instruction and call the existing `execute_block_data_transfer()`. This ensures PUSH/POP behavior is identical to ARM's STMDB/LDMIA with writeback — same address calculation, same register ordering, same SP update.
+
+### Tests (1 new, 57 total — all pass)
+- `test_thumb_push_pop` — PUSH {R0,R1} decrements SP by 8, stores R0=10 at 0xFF8 and R1=20 at 0xFFC. POP {R2,R3} loads R2=10, R3=20, restores SP to 0x1000. ✅
+
+### Verification
+- `cargo test` — **57 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 27 — Thumb SP-Relative Load/Store (Format 11)
+
+### Goal
+Implement Thumb Format 11 — `STR Rd, [SP, #imm8*4]` and `LDR Rd, [SP, #imm8*4]`.
+
+### Encoding
+```
+| 15 14 13 12 11 | 10  |  9  8 |  7 ─ 0  |
+|  1  0  0  1    |  L  |  Rd   |  imm8   |
+```
+- `L=0` → STR (store Rd to [SP + imm8<<2])
+- `L=1` → LDR (load Rd from [SP + imm8<<2])
+- Dispatch range: `36..=39` (bits [15:10])
+
+### Changes
+- **`src/cpu.rs`** — Added match arm `36..=39` in `execute_thumb_instruction()`. Extracts L-bit, Rd, imm8, computes `offset = imm8 << 2`, reads SP, and performs word-sized LDR or STR at `SP + offset`.
+- **`src/cpu/tests.rs`** — Added `test_thumb_sp_relative_ldr_str`: sets SP=0x200, stores 0xCAFEBABE via `STR R0, [SP, #4]` (encoding `0x9001`), then loads it back via `LDR R1, [SP, #4]` (encoding `0x9901`). Verifies memory at 0x204 and R1 value.
+
+### Test Added
+- `test_thumb_sp_relative_ldr_str` — STR R0,[SP,#4] writes 0xCAFEBABE to [0x204], LDR R1,[SP,#4] loads it back into R1. ✅
+
+### Verification
+- `cargo test` — **58 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 28 — Thumb Load/Store with Register Offset (Format 7 & 8) and Halfword Imm Offset (Format 10)
+
+### Goal
+Implement Thumb Format 7/8 (Load/Store with Register Offset — STR, STRB, LDR, LDRB, STRH, LDRSB, LDRH, LDRSH via `[Rn, Rm]`) and Format 10 (Halfword Load/Store with Immediate Offset — STRH/LDRH via `[Rn, #imm5*2]`).
+
+### Encoding — Format 7 & 8
+```
+| 15 14 13 12 | 11  10  9 |  8  7  6 |  5  4  3 |  2  1  0 |
+|  0  1  0  1 |    op     |    Rm    |    Rn    |    Rd    |
+```
+- 3-bit `op` selects among 8 operations: STR, STRB, LDR, LDRB, STRH, LDRSB, LDRH, LDRSH
+- Dispatch range: `20..=23` (bits [15:10])
+
+### Encoding — Format 10
+```
+| 15 14 13 12 | 11 | 10  9  8  7  6 |  5  4  3 |  2  1  0 |
+|  1  0  0  0 |  L |     imm5       |    Rn    |    Rd    |
+```
+- `L=0` → STRH, `L=1` → LDRH; offset = imm5 << 1
+- Dispatch range: `32..=35` (bits [15:10])
+
+### Changes
+- **`src/cpu.rs`** — Added match arm `20..=23` with 8-way `op` sub-dispatch for all register-offset load/store variants. Added match arm `32..=35` for halfword immediate-offset STRH/LDRH.
+- **`src/cpu/tests.rs`** — Added `test_thumb_ldr_str_reg_and_halfword`: tests STRH reg-offset, LDRSH sign extension (0xFF80 → 0xFFFFFF80), STRH imm-offset, and LDRH zero extension.
+
+### Test Added
+- `test_thumb_ldr_str_reg_and_halfword` — STRH R0,[R1,R2] writes 0xFF80 to [0x104], LDRSH R3,[R1,R2] sign-extends to 0xFFFFFF80, STRH R0,[R1,#2] writes to [0x102], LDRH R4,[R1,#2] zero-extends to 0xFF80. ✅
+
+### Verification
+- `cargo test` — **59 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 29 — Thumb Shift & Add/Sub (Formats 1 & 2)
+
+### Goal
+Implement Thumb Format 1 (Shift by Immediate — LSL, LSR, ASR) and Format 2 (Add/Subtract with register or 3-bit immediate).
+
+### Encoding — Format 1
+```
+| 15 14 13 | 12 11 | 10  9  8  7  6 |  5  4  3 |  2  1  0 |
+|  0  0  0 |  op   |    shift_amt   |    Rm    |    Rd    |
+```
+- `op`: 0=LSL, 1=LSR, 2=ASR; reuses `Self::shift_operand()`
+- Updates N, Z flags
+
+### Encoding — Format 2
+```
+| 15 14 13 | 12 11 | 10 |  9  |  8  7  6 |  5  4  3 |  2  1  0 |
+|  0  0  0 |  1  1 |  I | sub | Rm/imm3  |    Rn    |    Rd    |
+```
+- `I=1` → 3-bit immediate operand; `I=0` → register Rm
+- `sub=1` → SUB; `sub=0` → ADD
+- Updates N, Z, C, V flags
+- Dispatch range: `0..=7` (bits [15:10], top 3 bits = 000)
+
+### Changes
+- **`src/cpu.rs`** — Added match arm `0..=7` in `execute_thumb_instruction()`. Two-path decode: `op==3` → Format 2 (ADD/SUB with reg or imm3, full flag update), else → Format 1 (shift by immediate, delegates to `shift_operand()`).
+- **`src/cpu/tests.rs`** — Added `test_thumb_format_1_2_alu`: MOV R1,#10 then ADD R0,R1,#5 (Format 2, verifies R0==15) then LSL R2,R0,#1 (Format 1, verifies R2==30).
+
+### Test Added
+- `test_thumb_format_1_2_alu` — MOV R1,#10 → ADD R0,R1,#5 gives R0=15 → LSL R2,R0,#1 gives R2=30. ✅
+
+### Verification
+- `cargo test` — **60 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Session 30 — Thumb Long Branch with Link (Format 19)
+
+### Goal
+Implement Thumb Format 19 (BL — Long Branch with Link). This is a unique two-part instruction: a 16-bit prefix sets up the high bits of the target in LR, then a 16-bit suffix combines LR with the low bits, jumps, and saves the return address.
+
+### Encoding — Prefix (bit 11 = 0)
+```
+| 15 14 13 12 | 11 | 10 ─ 0  |
+|  1  1  1  1 |  0 | offset_hi (11 bits) |
+```
+- Sign-extends `offset_hi`, shifts left by 12, adds to PC+4, stores in LR
+- Dispatch range: `60..=61` (bits [15:10])
+
+### Encoding — Suffix (bit 11 = 1)
+```
+| 15 14 13 12 | 11 | 10 ─ 0  |
+|  1  1  1  1 |  1 | offset_lo (11 bits) |
+```
+- Adds `offset_lo << 1` to LR to form final target
+- Saves return address (current PC + 2, with bit 0 set for Thumb) into LR
+- Jumps to target
+- Dispatch range: `62..=63` (bits [15:10])
+
+### Changes
+- **`src/cpu.rs`** — Added match arms `60..=61` (prefix) and `62..=63` (suffix) in `execute_thumb_instruction()`. Prefix sign-extends the 11-bit high offset, shifts left 12, adds to PC+4, stores in LR. Suffix adds low offset to LR, saves return address with Thumb bit, and jumps.
+- **`src/cpu/tests.rs`** — Added `test_thumb_bl_long_branch`: places CPU at PC=0x1000 (uses 8KB RAM), executes prefix 0xF000 then suffix 0xF804, verifies LR=0x1004 after prefix, then PC=0x100C and LR=0x1005 after suffix.
+
+### Test Added
+- `test_thumb_bl_long_branch` — Prefix sets LR=0x1004, suffix jumps to PC=0x100C and saves LR=0x1005 (return address with Thumb bit). ✅
+
+### Verification
+- `cargo test` — **61 passed, 0 failed, 0 ignored** ✅
+
+---
+
+## Phase 5 — Complete ✅
+
+All Thumb instruction formats implemented:
+- Format 1: Shift by Immediate (LSL, LSR, ASR)
+- Format 2: Add/Subtract (register and 3-bit immediate)
+- Format 3: MOV/CMP/ADD/SUB with 8-bit immediate
+- Format 5: ALU operations (AND, EOR, LSL, LSR, ASR, TST, CMP, ORR, MVN)
+- Format 7 & 8: Load/Store with Register Offset (STR, STRB, LDR, LDRB, STRH, LDRSB, LDRH, LDRSH)
+- Format 9: Load/Store with Immediate Offset (word and byte)
+- Format 10: Halfword Load/Store with Immediate Offset
+- Format 11: SP-Relative Load/Store
+- Format 14: PUSH/POP
+- Format 16: Conditional Branch (+ SWI intercept)
+- Format 18: Unconditional Branch
+- Format 19: Long Branch with Link (BL)
+
+Total: **61 tests** (52 CPU + 9 memory), **0 failures**.
+
 ## What's Next (Phase 5)
-- [ ] Multi-file structured tests
-- [ ] Thumb instruction set (16-bit)
+- [x] Multi-file structured tests
+- [x] Thumb instruction set — fetch/decode scaffold
+- [x] Project reference document
+- [x] Thumb ALU — AND operation
+- [x] Memory test restoration (9 tests recovered)
+- [x] Thumb ALU — remaining data processing opcodes
+- [x] Thumb unconditional branch
+- [x] Thumb immediate operations (MOV/CMP/ADD/SUB imm8)
+- [x] Thumb conditional branch
+- [x] Thumb load/store with immediate offset (Format 9)
+- [x] Thumb PUSH/POP (Format 14)
+- [x] Thumb SP-relative load/store (Format 11)
+- [x] Thumb load/store with register offset (Format 7 & 8)
+- [x] Thumb halfword load/store with immediate offset (Format 10)
+- [x] Thumb shift/add-sub formats (Format 1 & 2)
+- [x] Thumb BL (long branch with link)
 
+---
 
+## Session 31 — load_rom Wasm Binding & CPU Reset
 
+### Goal
+Expose a `load_rom` WebAssembly binding so the JavaScript frontend can upload a raw compiled binary (`.bin` file) directly into CPU RAM at 0x8000. Ensure `cpu.reset()` provides a clean boot state.
 
+### Changes
+- **`src/cpu.rs`** — Updated `reset()` to set SP to top of RAM minus 64 KB (`ram_size - 0x10000`, matching `init_emulator` convention) and PC to the standard boot address `0x8000`, in addition to zeroing all registers and clearing halted state.
+- **`src/lib.rs`** — Added `#[wasm_bindgen] pub fn load_rom(bytes: &[u8]) -> bool` below `load_custom_hex`. It calls `cpu.reset()`, loads the binary at 0x8000, resets the cycle counter, and logs the byte count. Accepts `Uint8Array` on the JS side via wasm-bindgen.
 
+### Verification
+- `cargo test` — **61 passed, 0 failed, 0 ignored** ✅
 
+---
 
+## Session 32 — ROM Upload UI
 
+### Goal
+Add a file upload button to the nekodroid debug panel so users can select and load a compiled `.bin` file directly into the emulator's RAM.
 
+### Changes
+- **`src/main.ts`** — Imported `load_rom` from the Wasm module. Added HTML below the hex upload section: a "LOAD COMPILED ROM (.bin)" header, a hidden `<input type="file">`, and a purple-gradient "Select & Load .bin" button. Added event listeners: button click triggers the hidden file input; file `change` reads the selected `.bin` via `FileReader` as `ArrayBuffer`, converts to `Uint8Array`, calls `load_rom()`, updates the debug panel, and logs success/failure. File input is reset after each selection so the same file can be reloaded.
 
+### Verification
+- `cargo test` — **61 passed, 0 failed, 0 ignored** ✅
+- TypeScript: **0 errors** ✅
+
+---
+
+## Session 33 — ARM Pipeline PC+8 Fix & UART Buffer Reset
+
+### Goal
+Fix a critical CPU bug where ARM instructions reading R15 (PC) as an operand saw `instruction_addr + 4` instead of the architecturally correct `instruction_addr + 8`. This caused `LDR Rd, [PC, #imm]` (literal pool loads) to read from the wrong memory address, corrupting GCC-compiled bare-metal binaries.
+
+### Root Cause
+In `step()`, `advance_pc()` adds 4, setting PC to `instruction_addr + 4`. Instruction handlers that read R15 via `self.regs.read(15)` got the raw register value — missing the pipeline prefetch offset. ARM architecture requires R15 reads to return `instruction + 8` (ARM) or `instruction + 4` (Thumb).
+
+### Solution: `pipeline_offset` field
+Added a `pipeline_offset: u32` field to `RegisterFile`. During instruction execution, `step()` sets it to **4** (ARM, so read(15) = PC+4+4 = instruction+8) or **2** (Thumb, so read(15) = PC+2+2 = instruction+4). The `read()` method adds this offset only when reading R15. Writes to PC and `pc()` accessor are unaffected. Reset to 0 after execution.
+
+This approach cleanly handles edge cases (e.g., `B +0` targeting `instruction+8`) that broke an earlier "compare and restore" attempt.
+
+### Additional Fix: UART buffer clear on reset
+- Added `Mmu::clear_uart_buffer()` method
+- `cpu.reset()` now clears the UART TX buffer, preventing stale characters from prior runs appearing in output
+
+### Symptom Fixed
+GCC-compiled `main.c` (UART hello world) printed "**HI**ello from Bare-Metal C…" instead of "**He**llo from Bare-Metal C…" — the PC-relative literal pool load was off by 4 bytes, fetching the wrong string pointer.
+
+### Changes
+- **`src/cpu.rs`** — Added `pipeline_offset: u32` to `RegisterFile`, initialized to 0. Modified `read()` to add it when reading R15. In `step()`, set to 4 (ARM) or 2 (Thumb) before execution, reset to 0 after. Also added `clear_uart_buffer()` call in `reset()`.
+- **`src/memory.rs`** — Added `pub fn clear_uart_buffer(&mut self)` to `Mmu`.
+
+### Verification
+- `cargo test` — **61 passed, 0 failed, 0 ignored** ✅
+- `wasm-pack build --target web` — ✅
+- **Live ROM test** — `program.bin` (216 bytes) loaded and executed:
+  - `📟 UART: Hello from Bare-Metal C running on NekoDroid!` ✅
+  - `📟 UART: If you are reading this, your ARM CPU is fully functional.` ✅

@@ -351,3 +351,23 @@ pub fn load_custom_hex(hex_string: &str) -> bool {
         }
     })
 }
+
+/// Loads a raw binary payload (e.g., compiled C code) into RAM at 0x8000.
+#[wasm_bindgen]
+pub fn load_rom(bytes: &[u8]) -> bool {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(cpu) = borrow.as_mut() {
+            // Reset CPU state
+            cpu.reset();
+            // Load the binary at the standard boot address
+            cpu.load_program(0x8000, bytes);
+            // Reset cycle count
+            CYCLE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+            log(&format!("💿 ROM loaded successfully: {} bytes at 0x8000", bytes.len()));
+            true
+        } else {
+            false
+        }
+    })
+}

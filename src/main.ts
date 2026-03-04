@@ -11,6 +11,7 @@ import init, {
   step_cpu,
   load_demo_program,
   load_custom_hex,
+  load_rom,
 } from '../pkg/nekodroid.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -115,6 +116,11 @@ app.innerHTML = `
           placeholder="Paste ARM hex: e3a00005 e3a0100a e0802001"></textarea>
         <button id="btn-upload-hex" class="debug-btn hex-upload-btn">
           <span class="btn-icon">⬆️</span> Upload to RAM
+        </button>
+        <div class="rom-upload-header" style="margin-top: 10px; font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); letter-spacing: 0.15em;">LOAD COMPILED ROM (.bin)</div>
+        <input type="file" id="rom-file-input" accept=".bin" style="display: none;" />
+        <button id="btn-upload-rom" class="debug-btn hex-upload-btn" style="background: linear-gradient(135deg, #4c1d95, #7c3aed); border-color: #a855f7;">
+          <span class="btn-icon">💿</span> Select & Load .bin
         </button>
       </div>
     </div>
@@ -457,6 +463,32 @@ async function main() {
       } else {
         addLog('Failed to parse hex input', 'system');
       }
+    });
+
+    // ── ROM file upload ─────────────────────────────────────────────
+    const romFileInput = document.getElementById('rom-file-input') as HTMLInputElement;
+    document.getElementById('btn-upload-rom')!.addEventListener('click', () => {
+      romFileInput.click();
+    });
+
+    romFileInput.addEventListener('change', () => {
+      const file = romFileInput.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const buffer = reader.result as ArrayBuffer;
+        const bytes = new Uint8Array(buffer);
+        const ok = load_rom(bytes);
+        if (ok) {
+          updateDebugPanel();
+          addLog(`ROM loaded: ${file.name} (${bytes.length} bytes)`, 'success');
+        } else {
+          addLog('Failed to load ROM — is the emulator initialized?', 'system');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+      // Reset so the same file can be re-selected
+      romFileInput.value = '';
     });
 
   } catch (err) {

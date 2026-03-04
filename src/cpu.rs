@@ -45,6 +45,11 @@ pub struct RegisterFile {
     cpsr: u32,
     /// Saved Program Status Register (Supervisor mode)
     spsr_svc: u32,
+    /// Pipeline offset added when reading R15 as an operand.
+    /// ARM mode: +4 (so R15 reads as instruction_addr + 8, since advance_pc already added 4)
+    /// Thumb mode: +2 (so R15 reads as instruction_addr + 4, since advance_pc already added 2)
+    /// Set to 0 outside of instruction execution.
+    pipeline_offset: u32,
 }
 
 impl RegisterFile {
@@ -54,14 +59,23 @@ impl RegisterFile {
             regs: [0u32; 16],
             cpsr: MODE_USER, // Start in User mode
             spsr_svc: 0,
+            pipeline_offset: 0,
         }
     }
 
     // ── Register access ───────────────────────────────────────────────
 
     /// Reads a general-purpose register (0–15).
+    /// When reading R15 (PC), applies the pipeline offset so instructions
+    /// see the architecturally correct PC value (instruction + 8 in ARM,
+    /// instruction + 4 in Thumb).
     pub fn read(&self, reg: usize) -> u32 {
-        self.regs[reg & 0xF]
+        let r = reg & 0xF;
+        if r == REG_PC {
+            self.regs[REG_PC].wrapping_add(self.pipeline_offset)
+        } else {
+            self.regs[r]
+        }
     }
 
     /// Writes to a general-purpose register (0–15).
@@ -240,10 +254,17 @@ impl Cpu {
         }
     }
 
-    /// Resets the CPU to initial state: all registers zeroed, RAM cleared.
+    /// Resets the CPU to initial state: all registers zeroed,
+    /// SP set to top of RAM minus 64 KB, PC set to 0x8000.
     pub fn reset(&mut self) {
         self.regs = RegisterFile::new();
         self.halted = false;
+        // Clear UART output buffer
+        self.mmu.clear_uart_buffer();
+        // Set SP to top of RAM minus 64 KB (matches init_emulator convention)
+        self.regs.set_sp((self.mmu.ram_size() as u32).wrapping_sub(0x1_0000));
+        // Set PC to standard boot address
+        self.regs.set_pc(0x0000_8000);
     }
 
     /// Fetches the next instruction word from memory at the current PC.
@@ -523,12 +544,26 @@ impl Cpu {
         let pc_at_fetch = self.regs.pc();
         self.advance_pc();
 
+        // ── THUMB MODE ────────────────────────────────────────────────
+        // Thumb instructions are 16-bit and have their own decode table.
+        // Skip the ARM condition check and decode entirely.
+        if self.regs.is_thumb() {
+            // Thumb pipeline: reading R15 returns current_instruction + 4
+            self.regs.pipeline_offset = 2; // advance_pc added 2, so +2 more = +4 from fetch
+            self.execute_thumb_instruction(instr as u16, pc_at_fetch);
+            self.regs.pipeline_offset = 0;
+            return true;
+        }
+
         // ── CONDITION CHECK ───────────────────────────────────────────
         // ARM instructions bits [31:28] are the condition code.
         // If the condition is not met, the instruction is a NOP.
         if !self.check_condition(instr) {
             return true; // Instruction skipped, but CPU is not halted
         }
+
+        // ARM pipeline: reading R15 returns current_instruction + 8
+        self.regs.pipeline_offset = 4; // advance_pc added 4, so +4 more = +8 from fetch
 
         // ── DECODE & EXECUTE ──────────────────────────────────────────
         // Top-level decode using bits [27:25]
@@ -581,6 +616,8 @@ impl Cpu {
             }
             _ => unreachable!(),
         }
+
+        self.regs.pipeline_offset = 0;
 
         true
     }
@@ -1161,6 +1198,342 @@ impl Cpu {
         }
     }
 
+    // ── Thumb Instruction Decode ──────────────────────────────────────
+
+    /// Decodes and executes a 16-bit Thumb instruction.
+    ///
+    /// Thumb instructions are grouped by the top 6 bits (instr >> 10).
+    /// In Thumb mode the PC reads as current_instruction + 4 (not +8 like ARM).
+    fn execute_thumb_instruction(&mut self, instr: u16, pc_at_fetch: u32) {
+        match instr >> 10 {
+            0..=7 => { // Formats 1 & 2: Shift by Immediate, Add/Subtract
+                let op = (instr >> 11) & 0x3; // 0=LSL, 1=LSR, 2=ASR, 3=ADD/SUB
+
+                if op == 0x3 { // Format 2: Add/Subtract
+                    let i_bit = (instr >> 10) & 1 == 1; // 1 = Immediate, 0 = Register
+                    let sub_bit = (instr >> 9) & 1 == 1; // 1 = SUB, 0 = ADD
+                    let rn = ((instr >> 3) & 0x7) as usize;
+                    let rd = (instr & 0x7) as usize;
+                    let rn_val = self.regs.read(rn);
+
+                    let operand = if i_bit {
+                        ((instr >> 6) & 0x7) as u32 // 3-bit immediate
+                    } else {
+                        let rm = ((instr >> 6) & 0x7) as usize;
+                        self.regs.read(rm)
+                    };
+
+                    if sub_bit { // SUB
+                        let result = rn_val.wrapping_sub(operand);
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                        self.regs.set_flag_c(rn_val >= operand);
+                        let overflow = ((rn_val ^ operand) & (rn_val ^ result)) >> 31 != 0;
+                        self.regs.set_flag_v(overflow);
+                    } else { // ADD
+                        let result = rn_val.wrapping_add(operand);
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                        self.regs.set_flag_c(result < rn_val);
+                        let overflow = (!((rn_val ^ operand)) & (rn_val ^ result)) >> 31 != 0;
+                        self.regs.set_flag_v(overflow);
+                    }
+                } else { // Format 1: Shift by Immediate
+                    let shift_amount = ((instr >> 6) & 0x1F) as u32;
+                    let rm = ((instr >> 3) & 0x7) as usize;
+                    let rd = (instr & 0x7) as usize;
+                    let rm_val = self.regs.read(rm);
+
+                    let result = Self::shift_operand(rm_val, op as u8, shift_amount);
+                    self.regs.write(rd, result);
+                    self.regs.update_nz(result);
+                }
+            }
+            0b010000 => { // Format 5: Data Processing (ALU operations)
+                let op = (instr >> 6) & 0xF;
+                let rm = ((instr >> 3) & 0x7) as usize;
+                let rd = (instr & 0x7) as usize;
+                let rd_val = self.regs.read(rd);
+                let rm_val = self.regs.read(rm);
+                match op {
+                    0x0 => { // AND
+                        let result = rd_val & rm_val;
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                    }
+                    0x1 => { // EOR
+                        let result = rd_val ^ rm_val;
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                    }
+                    0x2 => { // LSL
+                        let result = Self::shift_operand(rd_val, 0, rm_val & 0xFF);
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                    }
+                    0x3 => { // LSR
+                        let result = Self::shift_operand(rd_val, 1, rm_val & 0xFF);
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                    }
+                    0x4 => { // ASR
+                        let result = Self::shift_operand(rd_val, 2, rm_val & 0xFF);
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                    }
+                    0x8 => { // TST (test — AND but result discarded)
+                        let result = rd_val & rm_val;
+                        self.regs.update_nz(result);
+                    }
+                    0xA => { // CMP (compare — SUB but result discarded)
+                        let result = rd_val.wrapping_sub(rm_val);
+                        self.regs.update_nz(result);
+                        self.regs.set_flag_c(rd_val >= rm_val);
+                        let overflow = ((rd_val ^ rm_val) & (rd_val ^ result)) >> 31 != 0;
+                        self.regs.set_flag_v(overflow);
+                    }
+                    0xC => { // ORR
+                        let result = rd_val | rm_val;
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                    }
+                    0xF => { // MVN (Move NOT)
+                        let result = !rm_val;
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                    }
+                    _ => self.log_unimplemented("Thumb ALU", instr as u32, pc_at_fetch),
+                }
+            }
+            8..=15 => { // Format 3: Move/Compare/Add/Subtract Immediate (top 3 bits = 001)
+                let op = (instr >> 11) & 0x3;
+                let rd = ((instr >> 8) & 0x7) as usize;
+                let imm8 = (instr & 0xFF) as u32;
+                let rd_val = self.regs.read(rd);
+                match op {
+                    0x0 => { // MOV Rd, #imm8
+                        self.regs.write(rd, imm8);
+                        self.regs.update_nz(imm8);
+                    }
+                    0x1 => { // CMP Rd, #imm8
+                        let result = rd_val.wrapping_sub(imm8);
+                        self.regs.update_nz(result);
+                        self.regs.set_flag_c(rd_val >= imm8);
+                        let overflow = ((rd_val ^ imm8) & (rd_val ^ result)) >> 31 != 0;
+                        self.regs.set_flag_v(overflow);
+                    }
+                    0x2 => { // ADD Rd, #imm8
+                        let result = rd_val.wrapping_add(imm8);
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                        self.regs.set_flag_c(result < rd_val);
+                        let overflow = (!(rd_val ^ imm8) & (rd_val ^ result)) >> 31 != 0;
+                        self.regs.set_flag_v(overflow);
+                    }
+                    0x3 => { // SUB Rd, #imm8
+                        let result = rd_val.wrapping_sub(imm8);
+                        self.regs.write(rd, result);
+                        self.regs.update_nz(result);
+                        self.regs.set_flag_c(rd_val >= imm8);
+                        let overflow = ((rd_val ^ imm8) & (rd_val ^ result)) >> 31 != 0;
+                        self.regs.set_flag_v(overflow);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            20..=23 => { // Format 7/8: Load/Store with Register Offset
+                let op = (instr >> 9) & 0x7;
+                let rm = ((instr >> 6) & 0x7) as usize;
+                let rn = ((instr >> 3) & 0x7) as usize;
+                let rd = (instr & 0x7) as usize;
+
+                let base_addr = self.regs.read(rn);
+                let offset = self.regs.read(rm);
+                let addr = base_addr.wrapping_add(offset);
+
+                match op {
+                    0b000 => { // STR Rd, [Rn, Rm]
+                        let val = self.regs.read(rd);
+                        self.mmu.write_u32(addr, val);
+                    }
+                    0b001 => { // STRB Rd, [Rn, Rm]
+                        let val = (self.regs.read(rd) & 0xFF) as u8;
+                        self.mmu.write_u8(addr, val);
+                    }
+                    0b010 => { // LDR Rd, [Rn, Rm]
+                        let val = self.mmu.read_u32(addr);
+                        self.regs.write(rd, val);
+                    }
+                    0b011 => { // LDRB Rd, [Rn, Rm]
+                        let val = self.mmu.read_u8(addr) as u32;
+                        self.regs.write(rd, val);
+                    }
+                    0b100 => { // STRH Rd, [Rn, Rm]
+                        let val = (self.regs.read(rd) & 0xFFFF) as u16;
+                        self.mmu.write_u16(addr, val);
+                    }
+                    0b101 => { // LDRSB Rd, [Rn, Rm]
+                        let val = self.mmu.read_u8(addr) as i8 as i32 as u32;
+                        self.regs.write(rd, val);
+                    }
+                    0b110 => { // LDRH Rd, [Rn, Rm]
+                        let val = self.mmu.read_u16(addr) as u32;
+                        self.regs.write(rd, val);
+                    }
+                    0b111 => { // LDRSH Rd, [Rn, Rm]
+                        let val = self.mmu.read_u16(addr) as i16 as i32 as u32;
+                        self.regs.write(rd, val);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            24..=31 => { // Format 9: Load/Store with Immediate Offset (top 3 bits = 011)
+                let b_bit = (instr >> 12) & 1 == 1; // 1 = Byte, 0 = Word
+                let l_bit = (instr >> 11) & 1 == 1; // 1 = Load, 0 = Store
+                let imm5  = ((instr >> 6) & 0x1F) as u32;
+                let rn    = ((instr >> 3) & 0x7) as usize;
+                let rd    = (instr & 0x7) as usize;
+
+                let base_addr = self.regs.read(rn);
+
+                if b_bit { // Byte transfer
+                    let addr = base_addr.wrapping_add(imm5); // Offset is imm5
+                    if l_bit { // LDRB
+                        let val = self.mmu.read_u8(addr) as u32;
+                        self.regs.write(rd, val);
+                    } else { // STRB
+                        let val = (self.regs.read(rd) & 0xFF) as u8;
+                        self.mmu.write_u8(addr, val);
+                    }
+                } else { // Word transfer
+                    let addr = base_addr.wrapping_add(imm5 << 2); // Offset is imm5 * 4
+                    if l_bit { // LDR
+                        let val = self.mmu.read_u32(addr);
+                        self.regs.write(rd, val);
+                    } else { // STR
+                        let val = self.regs.read(rd);
+                        self.mmu.write_u32(addr, val);
+                    }
+                }
+            }
+            32..=35 => { // Format 10: Halfword Load/Store with Immediate Offset
+                let l_bit = (instr >> 11) & 1 == 1; // 1 = LDRH, 0 = STRH
+                let imm5 = ((instr >> 6) & 0x1F) as u32;
+                let rn = ((instr >> 3) & 0x7) as usize;
+                let rd = (instr & 0x7) as usize;
+
+                // Offset is imm5 * 2
+                let offset = imm5 << 1;
+                let base_addr = self.regs.read(rn);
+                let addr = base_addr.wrapping_add(offset);
+
+                if l_bit { // LDRH Rd, [Rn, #imm]
+                    let val = self.mmu.read_u16(addr) as u32;
+                    self.regs.write(rd, val);
+                } else { // STRH Rd, [Rn, #imm]
+                    let val = (self.regs.read(rd) & 0xFFFF) as u16;
+                    self.mmu.write_u16(addr, val);
+                }
+            }
+            36..=39 => { // Format 11: SP-Relative Load/Store (top 4 bits = 1001)
+                let l_bit = (instr >> 11) & 1 == 1; // 1 = Load, 0 = Store
+                let rd = ((instr >> 8) & 0x7) as usize;
+                let imm8 = (instr & 0xFF) as u32;
+
+                let offset = imm8 << 2; // Offset is imm8 * 4
+                let sp_val = self.regs.read(13); // R13 = SP
+                let addr = sp_val.wrapping_add(offset);
+
+                if l_bit { // LDR Rd, [SP, #imm]
+                    let val = self.mmu.read_u32(addr);
+                    self.regs.write(rd, val);
+                } else { // STR Rd, [SP, #imm]
+                    let val = self.regs.read(rd);
+                    self.mmu.write_u32(addr, val);
+                }
+            }
+            44..=47 => { // Format 14: PUSH / POP (top 4 bits = 1011)
+                let l_bit = (instr >> 11) & 1 == 1; // 1 = POP, 0 = PUSH
+                let r_bit = (instr >> 8) & 1 == 1;  // PUSH LR or POP PC
+                let reg_list = (instr & 0xFF) as u32;
+
+                if l_bit { // POP — equivalent to LDMIA SP!, {reg_list, PC?}
+                    let mut arm_reg_list = reg_list;
+                    if r_bit { arm_reg_list |= 1 << 15; } // Add PC (R15)
+                    let dummy_arm = 0xE8BD0000 | arm_reg_list;
+                    self.execute_block_data_transfer(dummy_arm);
+                } else { // PUSH — equivalent to STMDB SP!, {reg_list, LR?}
+                    let mut arm_reg_list = reg_list;
+                    if r_bit { arm_reg_list |= 1 << 14; } // Add LR (R14)
+                    let dummy_arm = 0xE92D0000 | arm_reg_list;
+                    self.execute_block_data_transfer(dummy_arm);
+                }
+            }
+            52..=55 => { // Format 16: Conditional Branch (top 4 bits = 1101)
+                let cond = ((instr >> 8) & 0xF) as u32;
+
+                // SWI intercept: cond == 0xF means this is a Thumb SWI, not a branch
+                if cond == 0xF {
+                    let swi_num = (instr & 0xFF) as u32;
+                    let dummy_swi = 0xEF000000 | swi_num;
+                    self.execute_swi(dummy_swi, pc_at_fetch);
+                    return;
+                }
+
+                // Reuse ARM condition checker by placing cond in bits [31:28]
+                let dummy_instr = cond << 28;
+                if self.check_condition(dummy_instr) {
+                    let imm8 = (instr & 0xFF) as u32;
+                    // Sign extend 8-bit immediate to 32 bits, shift left by 1
+                    let offset = if imm8 & 0x80 != 0 {
+                        (imm8 | 0xFFFFFF00) << 1
+                    } else {
+                        imm8 << 1
+                    };
+                    let target = pc_at_fetch.wrapping_add(4).wrapping_add(offset);
+                    self.regs.set_pc(target);
+                }
+            }
+            0b111000 | 0b111001 => { // Format 18: Unconditional Branch (top 5 bits = 11100)
+                let offset11 = instr & 0x07FF;
+                // Sign extend the 11-bit offset to 32 bits, then shift left by 1
+                let offset = if offset11 & 0x0400 != 0 {
+                    ((offset11 as u32) | 0xFFFFF800) << 1
+                } else {
+                    (offset11 as u32) << 1
+                };
+                // Add offset to PC (Thumb PC reads as pc_at_fetch + 4)
+                let target = pc_at_fetch.wrapping_add(4).wrapping_add(offset);
+                self.regs.set_pc(target);
+            }
+            60..=61 => { // Format 19: BL (Prefix)
+                let offset_11 = (instr & 0x7FF) as u32;
+                // Sign extend 11 bits to 32 bits, then shift left by 12
+                let offset = if offset_11 & 0x400 != 0 {
+                    (offset_11 | 0xFFFFF800) << 12
+                } else {
+                    offset_11 << 12
+                };
+                // Target high = PC + offset (Thumb PC reads as pc_at_fetch + 4)
+                let target_high = pc_at_fetch.wrapping_add(4).wrapping_add(offset);
+                // Store intermediate value in LR
+                self.regs.set_lr(target_high);
+            }
+            62..=63 => { // Format 19: BL (Suffix)
+                let offset_11 = (instr & 0x7FF) as u32;
+                let target_high = self.regs.lr();
+                // Add the low 11 bits (shifted left by 1) to the high target
+                let target = target_high.wrapping_add(offset_11 << 1);
+
+                // Save return address in LR: instruction AFTER this suffix (suffix PC + 2)
+                // Set bit 0 to 1 to indicate we are returning to Thumb mode
+                self.regs.set_lr(pc_at_fetch.wrapping_add(2) | 1);
+                self.regs.set_pc(target);
+            }
+            _ => self.log_unimplemented("Thumb", instr as u32, pc_at_fetch),
+        }
+    }
+
     // ── Unimplemented handler ─────────────────────────────────────────
 
     fn log_unimplemented(&self, category: &str, instr: u32, pc: u32) {
@@ -1181,750 +1554,5 @@ impl Cpu {
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Helper: creates a CPU and loads a program at address 0.
-    fn cpu_with_program(program: &[u8]) -> Cpu {
-        let mut cpu = Cpu::new(4096);
-        cpu.load_program(0, program);
-        cpu
-    }
-
-    // ── RegisterFile tests ────────────────────────────────────────────
-
-    #[test]
-    fn test_register_read_write() {
-        let mut rf = RegisterFile::new();
-        rf.write(0, 0xDEADBEEF);
-        assert_eq!(rf.read(0), 0xDEADBEEF);
-        rf.write(REG_PC, 0x8000);
-        assert_eq!(rf.pc(), 0x8000);
-    }
-
-    #[test]
-    fn test_sp_lr_pc() {
-        let mut rf = RegisterFile::new();
-        rf.set_sp(0x7FFF_0000);
-        rf.set_lr(0x0000_1234);
-        rf.set_pc(0x0000_8000);
-        assert_eq!(rf.sp(), 0x7FFF_0000);
-        assert_eq!(rf.lr(), 0x0000_1234);
-        assert_eq!(rf.pc(), 0x0000_8000);
-    }
-
-    #[test]
-    fn test_cpsr_flags() {
-        let mut rf = RegisterFile::new();
-        assert!(!rf.flag_n());
-        assert!(!rf.flag_z());
-
-        rf.set_flag_n(true);
-        rf.set_flag_z(true);
-        rf.set_flag_c(true);
-        rf.set_flag_v(true);
-        assert!(rf.flag_n());
-        assert!(rf.flag_z());
-        assert!(rf.flag_c());
-        assert!(rf.flag_v());
-
-        rf.set_flag_n(false);
-        assert!(!rf.flag_n());
-        assert!(rf.flag_z());
-    }
-
-    #[test]
-    fn test_thumb_mode() {
-        let mut rf = RegisterFile::new();
-        assert!(!rf.is_thumb());
-        rf.set_thumb(true);
-        assert!(rf.is_thumb());
-        rf.set_thumb(false);
-        assert!(!rf.is_thumb());
-    }
-
-    #[test]
-    fn test_update_nz() {
-        let mut rf = RegisterFile::new();
-        rf.update_nz(0);
-        assert!(rf.flag_z());
-        assert!(!rf.flag_n());
-        rf.update_nz(0x8000_0000);
-        assert!(!rf.flag_z());
-        assert!(rf.flag_n());
-    }
-
-    // ── CPU fetch/advance tests ───────────────────────────────────────
-
-    #[test]
-    fn test_cpu_fetch_arm() {
-        let mut cpu = Cpu::new(1024);
-        cpu.mmu.write_u32(0, 0xE3A01001); // MOV R1, #1
-        cpu.regs.set_pc(0);
-        assert_eq!(cpu.fetch(), 0xE3A01001);
-    }
-
-    #[test]
-    fn test_cpu_fetch_thumb() {
-        let mut cpu = Cpu::new(1024);
-        cpu.mmu.write_u16(0, 0x2001);
-        cpu.regs.set_pc(0);
-        cpu.regs.set_thumb(true);
-        assert_eq!(cpu.fetch(), 0x2001);
-    }
-
-    #[test]
-    fn test_cpu_advance_pc() {
-        let mut cpu = Cpu::new(1024);
-        cpu.regs.set_pc(0x100);
-        cpu.advance_pc();
-        assert_eq!(cpu.regs.pc(), 0x104);
-        cpu.regs.set_thumb(true);
-        cpu.advance_pc();
-        assert_eq!(cpu.regs.pc(), 0x106);
-    }
-
-    #[test]
-    fn test_cpu_load_program() {
-        let mut cpu = Cpu::new(1024);
-        let prog = [0x01, 0x10, 0xA0, 0xE3]; // MOV R1, #1 (LE)
-        cpu.load_program(0x200, &prog);
-        assert_eq!(cpu.regs.pc(), 0x200);
-        assert_eq!(cpu.mmu.read_u32(0x200), 0xE3A01001);
-    }
-
-    // ── ALU execution tests ───────────────────────────────────────────
-
-    #[test]
-    fn test_basic_alu() {
-        // MOV R0, #5   →  E3A00005
-        // ADD R1, R0, #10 → E280100A
-        //
-        // ARM encoding for MOV R0, #5:
-        //   cond=1110(AL) 001 opcode=1101 S=0 Rn=0000 Rd=0000 rotate=0000 imm8=00000101
-        //   = 0xE3A00005
-        //
-        // ARM encoding for ADD R1, R0, #10:
-        //   cond=1110(AL) 001 opcode=0100 S=0 Rn=0000 Rd=0001 rotate=0000 imm8=00001010
-        //   = 0xE280100A
-        let program: Vec<u8> = [
-            0xE3A00005u32.to_le_bytes(), // MOV R0, #5
-            0xE280100Au32.to_le_bytes(), // ADD R1, R0, #10
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #5
-        assert_eq!(cpu.regs.read(0), 5, "R0 should be 5 after MOV R0, #5");
-
-        cpu.step(); // ADD R1, R0, #10
-        assert_eq!(cpu.regs.read(1), 15, "R1 should be 15 after ADD R1, R0, #10");
-    }
-
-    #[test]
-    fn test_mov_register() {
-        // MOV R0, #42  → E3A0002A
-        // MOV R1, R0   → E1A01000 (register form: I=0, opcode=MOV, Rm=R0)
-        let program: Vec<u8> = [
-            0xE3A0002Au32.to_le_bytes(), // MOV R0, #42
-            0xE1A01000u32.to_le_bytes(), // MOV R1, R0
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step();
-        cpu.step();
-        assert_eq!(cpu.regs.read(1), 42);
-    }
-
-    #[test]
-    fn test_sub_instruction() {
-        // MOV R0, #20  → E3A00014
-        // SUB R1, R0, #5 → E2401005
-        //   cond=AL 001 opcode=0010(SUB) S=0 Rn=R0 Rd=R1 imm=5
-        let program: Vec<u8> = [
-            0xE3A00014u32.to_le_bytes(), // MOV R0, #20
-            0xE2401005u32.to_le_bytes(), // SUB R1, R0, #5
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step();
-        cpu.step();
-        assert_eq!(cpu.regs.read(1), 15);
-    }
-
-    #[test]
-    fn test_cmp_sets_flags() {
-        // MOV R0, #5   → E3A00005
-        // CMP R0, #5   → E3500005
-        //   cond=AL 001 opcode=1010(CMP) S=1 Rn=R0 Rd=0 imm=5
-        let program: Vec<u8> = [
-            0xE3A00005u32.to_le_bytes(), // MOV R0, #5
-            0xE3500005u32.to_le_bytes(), // CMP R0, #5
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV
-        cpu.step(); // CMP
-        assert!(cpu.regs.flag_z(), "Z flag should be set (5 - 5 = 0)");
-        assert!(!cpu.regs.flag_n(), "N flag should be clear");
-    }
-
-    // ── Branch tests ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_branch_forward() {
-        // B +8   → EA000000
-        //   cond=AL 101 L=0 offset=0x000000
-        //   target = PC_fetch + 8 + (0 << 2) = 0 + 8 = 8
-        //   (skip 1 instruction)
-        let program: Vec<u8> = [
-            0xEA000000u32.to_le_bytes(), // B +8 (branch to addr 8)
-            0xE3A00001u32.to_le_bytes(), // MOV R0, #1 (should be skipped)
-            0xE3A01002u32.to_le_bytes(), // MOV R1, #2 (branch target)
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // B +8
-        assert_eq!(cpu.regs.pc(), 8, "PC should jump to 8");
-
-        cpu.step(); // MOV R1, #2
-        assert_eq!(cpu.regs.read(1), 2);
-        assert_eq!(cpu.regs.read(0), 0, "R0 should still be 0 (MOV R0,#1 was skipped)");
-    }
-
-    #[test]
-    fn test_branch_backward() {
-        // Set up a tiny loop:
-        // 0x00: MOV R0, #0       → E3A00000
-        // 0x04: ADD R0, R0, #1   → E2800001
-        // 0x08: B -8 (back to 0x04) → EAFFFFFD
-        //   offset = -2 in instruction words → 0xFFFFFD sign-extended
-        //   target = 0x08 + 8 + (0x3FFFFFD << 2)... let me compute:
-        //   24-bit: 0xFFFFFD, sign-extend → 0xFFFFFFFD, <<2 → 0xFFFFFFF4
-        //   target = 0x08 + 8 + 0xFFFFFFF4 = 0x04 ✓
-        let program: Vec<u8> = [
-            0xE3A00000u32.to_le_bytes(), // MOV R0, #0
-            0xE2800001u32.to_le_bytes(), // ADD R0, R0, #1
-            0xEAFFFFFDu32.to_le_bytes(), // B back to 0x04
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #0
-        assert_eq!(cpu.regs.read(0), 0);
-
-        cpu.step(); // ADD R0, R0, #1 → R0 = 1
-        assert_eq!(cpu.regs.read(0), 1);
-
-        cpu.step(); // B back to 0x04
-        assert_eq!(cpu.regs.pc(), 0x04, "PC should loop back to 0x04");
-
-        cpu.step(); // ADD R0, R0, #1 → R0 = 2
-        assert_eq!(cpu.regs.read(0), 2);
-    }
-
-    // ── Condition code tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_conditional_execution() {
-        // MOV R0, #5     → E3A00005  (AL)
-        // CMP R0, #5     → E3500005  (AL, sets Z=1)
-        // MOVEQ R1, #99  → 03A01063  (EQ — executes because Z=1)
-        // MOVNE R2, #77  → 13A0204D  (NE — skipped because Z=1)
-        let program: Vec<u8> = [
-            0xE3A00005u32.to_le_bytes(), // MOV R0, #5
-            0xE3500005u32.to_le_bytes(), // CMP R0, #5
-            0x03A01063u32.to_le_bytes(), // MOVEQ R1, #99
-            0x13A0204Du32.to_le_bytes(), // MOVNE R2, #77
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV
-        cpu.step(); // CMP → Z=1
-        cpu.step(); // MOVEQ R1, #99 → executes (Z=1)
-        cpu.step(); // MOVNE R2, #77 → skipped (Z=1, NE needs Z=0)
-
-        assert_eq!(cpu.regs.read(1), 99, "R1 should be 99 (EQ condition met)");
-        assert_eq!(cpu.regs.read(2), 0, "R2 should be 0 (NE condition NOT met)");
-    }
-
-    // ── Barrel shifter tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_shift_lsl() {
-        // MOV R1, #3    → E3A01003
-        // MOV R0, R1, LSL #2 → E1A00101
-        //   bits: cond=AL 000 opcode=1101(MOV) S=0 Rn=0 Rd=0 shift_amount=00010 type=00(LSL) 0 Rm=0001
-        //   = E | 1A0 | 0 | 1 | 0 | 1
-        //   = 0xE1A00101
-        //   R0 = 3 << 2 = 12
-        let program: Vec<u8> = [
-            0xE3A01003u32.to_le_bytes(), // MOV R1, #3
-            0xE1A00101u32.to_le_bytes(), // MOV R0, R1, LSL #2
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R1, #3
-        cpu.step(); // MOV R0, R1, LSL #2
-        assert_eq!(cpu.regs.read(0), 12, "3 << 2 = 12");
-    }
-
-    #[test]
-    fn test_shift_lsr() {
-        // MOV R1, #32   → E3A01020
-        // MOV R0, R1, LSR #3 → E1A001A1
-        //   shift_amount=00011 type=01(LSR) 0 Rm=R1
-        //   R0 = 32 >> 3 = 4
-        let program: Vec<u8> = [
-            0xE3A01020u32.to_le_bytes(), // MOV R1, #32
-            0xE1A001A1u32.to_le_bytes(), // MOV R0, R1, LSR #3
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step();
-        cpu.step();
-        assert_eq!(cpu.regs.read(0), 4, "32 >> 3 = 4");
-    }
-
-    #[test]
-    fn test_add_with_shift() {
-        // R1 = 10, R2 = 3
-        // ADD R0, R1, R2, LSL #1 → R0 = 10 + (3 << 1) = 16
-        // E0810082
-        //   cond=AL 000 opcode=0100(ADD) S=0 Rn=R1 Rd=R0 shift=00001 type=00(LSL) 0 Rm=R2
-        let program: Vec<u8> = [
-            0xE3A0100Au32.to_le_bytes(), // MOV R1, #10
-            0xE3A02003u32.to_le_bytes(), // MOV R2, #3
-            0xE0810082u32.to_le_bytes(), // ADD R0, R1, R2, LSL #1
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R1, #10
-        cpu.step(); // MOV R2, #3
-        cpu.step(); // ADD R0, R1, R2, LSL #1
-        assert_eq!(cpu.regs.read(0), 16, "10 + (3 << 1) = 16");
-    }
-
-    // ── Load/Store tests ──────────────────────────────────────────────
-
-    #[test]
-    fn test_basic_str_ldr() {
-        // STR R0, [R1]  — store R0 at address in R1
-        // LDR R2, [R1]  — load from address in R1 into R2
-        //
-        // STR R0, [R1, #0] → E5810000
-        //   cond=AL 01 I=0 P=1 U=1 B=0 W=0 L=0 Rn=R1 Rd=R0 offset=0
-        // LDR R2, [R1, #0] → E5912000
-        //   cond=AL 01 I=0 P=1 U=1 B=0 W=0 L=1 Rn=R1 Rd=R2 offset=0
-        let program: Vec<u8> = [
-            0xE3A000FFu32.to_le_bytes(), // MOV R0, #255
-            0xE3A01C01u32.to_le_bytes(), // MOV R1, #256 (0x100)
-            0xE5810000u32.to_le_bytes(), // STR R0, [R1]
-            0xE5912000u32.to_le_bytes(), // LDR R2, [R1]
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #255
-        cpu.step(); // MOV R1, #256
-        cpu.step(); // STR R0, [R1]
-
-        // Verify memory was written
-        assert_eq!(cpu.mmu.read_u32(0x100), 255, "Memory at 0x100 should be 255");
-
-        cpu.step(); // LDR R2, [R1]
-        assert_eq!(cpu.regs.read(2), 255, "R2 should be 255 after LDR");
-    }
-
-    #[test]
-    fn test_str_pre_indexed_writeback() {
-        // STR R0, [R1, #4]! — store R0 at R1+4, then R1 = R1+4
-        //
-        // E5A10004:
-        //   cond=AL 01 I=0 P=1 U=1 B=0 W=1 L=0 Rn=R1 Rd=R0 offset=4
-        let program: Vec<u8> = [
-            0xE3A0002Au32.to_le_bytes(), // MOV R0, #42
-            0xE3A01C01u32.to_le_bytes(), // MOV R1, #256 (0x100)
-            0xE5A10004u32.to_le_bytes(), // STR R0, [R1, #4]!
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #42
-        cpu.step(); // MOV R1, #256
-        cpu.step(); // STR R0, [R1, #4]!
-
-        assert_eq!(cpu.mmu.read_u32(0x104), 42, "Memory at 0x104 should be 42");
-        assert_eq!(cpu.regs.read(1), 0x104, "R1 should be updated to 0x104 (writeback)");
-    }
-
-    #[test]
-    fn test_ldrb_strb() {
-        // STRB R0, [R1] — store low byte of R0
-        // LDRB R2, [R1] — load byte into R2
-        //
-        // STRB R0, [R1, #0] → E5C10000
-        //   cond=AL 01 I=0 P=1 U=1 B=1 W=0 L=0 Rn=R1 Rd=R0 offset=0
-        // LDRB R2, [R1, #0] → E5D12000
-        //   cond=AL 01 I=0 P=1 U=1 B=1 W=0 L=1 Rn=R1 Rd=R2 offset=0
-        let program: Vec<u8> = [
-            0xE3A000FFu32.to_le_bytes(), // MOV R0, #255
-            0xE3A01C02u32.to_le_bytes(), // MOV R1, #512 (0x200)
-            0xE5C10000u32.to_le_bytes(), // STRB R0, [R1]
-            0xE5D12000u32.to_le_bytes(), // LDRB R2, [R1]
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #255
-        cpu.step(); // MOV R1, #512
-        cpu.step(); // STRB R0, [R1]
-
-        assert_eq!(cpu.mmu.read_u8(0x200), 0xFF, "Byte at 0x200 should be 0xFF");
-        // Only 1 byte written — next byte should be 0
-        assert_eq!(cpu.mmu.read_u8(0x201), 0x00);
-
-        cpu.step(); // LDRB R2, [R1]
-        assert_eq!(cpu.regs.read(2), 0xFF, "R2 should be 0xFF after LDRB");
-    }
-
-    // ── LDM/STM (block data transfer) tests ───────────────────────────
-
-    #[test]
-    fn test_push_pop_stack() {
-        // STMDB R13!, {R0, R1}  (PUSH R0, R1)
-        //   cond=AL 100 P=1 U=0 S=0 W=1 L=0 Rn=R13 reg_list=0x0003
-        //   = 0xE92D0003
-        //
-        // LDMIA R13!, {R2, R3}  (POP into R2, R3)
-        //   cond=AL 100 P=0 U=1 S=0 W=1 L=1 Rn=R13 reg_list=0x000C
-        //   = 0xE8BD000C
-        let program: Vec<u8> = [
-            0xE3A000AAu32.to_le_bytes(), // MOV R0, #0xAA
-            0xE3A010BBu32.to_le_bytes(), // MOV R1, #0xBB
-            0xE92D0003u32.to_le_bytes(), // STMDB R13!, {R0, R1}  (PUSH)
-            0xE8BD000Cu32.to_le_bytes(), // LDMIA R13!, {R2, R3}  (POP)
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.regs.set_sp(0x1000); // Set SP (within 4KB test RAM)
-
-        cpu.step(); // MOV R0, #0xAA
-        cpu.step(); // MOV R1, #0xBB
-
-        assert_eq!(cpu.regs.read(0), 0xAA);
-        assert_eq!(cpu.regs.read(1), 0xBB);
-
-        cpu.step(); // STMDB R13!, {R0, R1} — PUSH
-
-        // SP should decrement by 8 (2 registers × 4 bytes)
-        assert_eq!(cpu.regs.sp(), 0x1000 - 8, "SP should decrement by 8 after PUSH");
-        // Memory: R0 at lower addr, R1 at higher (lowest-numbered reg at lowest addr)
-        assert_eq!(cpu.mmu.read_u32(0x0FF8), 0xAA, "R0 value at SP");
-        assert_eq!(cpu.mmu.read_u32(0x0FFC), 0xBB, "R1 value at SP+4");
-
-        cpu.step(); // LDMIA R13!, {R2, R3} — POP
-
-        // SP should be back to original
-        assert_eq!(cpu.regs.sp(), 0x1000, "SP should be restored after POP");
-        // R2 gets the value that was R0, R3 gets the value that was R1
-        assert_eq!(cpu.regs.read(2), 0xAA, "R2 should be 0xAA (popped R0's value)");
-        assert_eq!(cpu.regs.read(3), 0xBB, "R3 should be 0xBB (popped R1's value)");
-    }
-
-    #[test]
-    fn test_stm_ldm_multiple() {
-        // Store 4 registers, load them back into different registers
-        // STMIA R5, {R0-R3}  (no writeback)
-        //   cond=AL 100 P=0 U=1 S=0 W=0 L=0 Rn=R5 reg_list=0x000F
-        //   = 0xE885000F
-        // LDMIA R5, {R4, R6, R7, R8}  (no writeback)
-        //   cond=AL 100 P=0 U=1 S=0 W=0 L=1 Rn=R5 reg_list=0x01D0
-        //   = 0xE89501D0
-        let program: Vec<u8> = [
-            0xE3A0000Au32.to_le_bytes(), // MOV R0, #10
-            0xE3A01014u32.to_le_bytes(), // MOV R1, #20
-            0xE3A0201Eu32.to_le_bytes(), // MOV R2, #30
-            0xE3A03028u32.to_le_bytes(), // MOV R3, #40
-            0xE3A05C02u32.to_le_bytes(), // MOV R5, #0x200
-            0xE885000Fu32.to_le_bytes(), // STMIA R5, {R0-R3}
-            0xE89501D0u32.to_le_bytes(), // LDMIA R5, {R4, R6, R7, R8}
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        for _ in 0..7 { cpu.step(); }
-
-        // R4 gets value from addr 0x200 (was R0 = 10)
-        assert_eq!(cpu.regs.read(4), 10);
-        // R6 gets value from addr 0x204 (was R1 = 20)
-        assert_eq!(cpu.regs.read(6), 20);
-        // R7 gets value from addr 0x208 (was R2 = 30)
-        assert_eq!(cpu.regs.read(7), 30);
-        // R8 gets value from addr 0x20C (was R3 = 40)
-        assert_eq!(cpu.regs.read(8), 40);
-    }
-
-    // ── Multiply tests ────────────────────────────────────────────────
-
-    #[test]
-    fn test_mul() {
-        // MUL R0, R1, R2  (R0 = R1 * R2 = 5 * 6 = 30)
-        // ARM encoding: cond | 000000 | A=0 | S=0 | Rd | 0000 | Rs | 1001 | Rm
-        //   Rd=R0, Rs=R2, Rm=R1
-        //   = 0xE0000291
-        let program: Vec<u8> = [
-            0xE3A01005u32.to_le_bytes(), // MOV R1, #5
-            0xE3A02006u32.to_le_bytes(), // MOV R2, #6
-            0xE0000291u32.to_le_bytes(), // MUL R0, R1, R2
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R1, #5
-        cpu.step(); // MOV R2, #6
-        cpu.step(); // MUL R0, R1, R2
-        assert_eq!(cpu.regs.read(0), 30, "5 * 6 = 30");
-    }
-
-    #[test]
-    fn test_mla() {
-        // MLA R0, R1, R2, R3  (R0 = R1 * R2 + R3 = 5 * 6 + 10 = 40)
-        // ARM encoding: cond | 000000 | A=1 | S=0 | Rd | Rn | Rs | 1001 | Rm
-        //   Rd=R0, Rn=R3, Rs=R2, Rm=R1
-        //   = 0xE0203291
-        let program: Vec<u8> = [
-            0xE3A01005u32.to_le_bytes(), // MOV R1, #5
-            0xE3A02006u32.to_le_bytes(), // MOV R2, #6
-            0xE3A0300Au32.to_le_bytes(), // MOV R3, #10
-            0xE0203291u32.to_le_bytes(), // MLA R0, R1, R2, R3
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R1, #5
-        cpu.step(); // MOV R2, #6
-        cpu.step(); // MOV R3, #10
-        cpu.step(); // MLA R0, R1, R2, R3
-        assert_eq!(cpu.regs.read(0), 40, "5 * 6 + 10 = 40");
-    }
-
-    // ── BX tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_bx_to_thumb() {
-        // Set R0 = 0x101 (LSB set → switch to Thumb)
-        // BX R0 → PC = 0x100, T flag set
-        // BX R0 = 0xE12FFF10
-        let program: Vec<u8> = [
-            0xE3A00F40u32.to_le_bytes(), // MOV R0, #256 (0x100)
-            0xE2800001u32.to_le_bytes(), // ADD R0, R0, #1  → R0 = 0x101
-            0xE12FFF10u32.to_le_bytes(), // BX R0
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #256
-        cpu.step(); // ADD R0, R0, #1 → R0 = 0x101
-        cpu.step(); // BX R0
-
-        assert_eq!(cpu.regs.pc(), 0x100, "PC should be 0x100 (LSB cleared)");
-        assert!(cpu.regs.is_thumb(), "T flag should be set (switched to Thumb mode)");
-    }
-
-    #[test]
-    fn test_bx_stay_arm() {
-        // Set R0 = 0x100 (LSB clear → stay ARM)
-        // BX R0 → PC = 0x100, T flag clear
-        let program: Vec<u8> = [
-            0xE3A00F40u32.to_le_bytes(), // MOV R0, #256 (0x100)
-            0xE12FFF10u32.to_le_bytes(), // BX R0
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #256
-        cpu.step(); // BX R0
-
-        assert_eq!(cpu.regs.pc(), 0x100, "PC should be 0x100");
-        assert!(!cpu.regs.is_thumb(), "T flag should be clear (staying ARM)");
-    }
-
-    // ── SWI tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_swi_exception() {
-        // SWI #0x42  (syscall 0x42)
-        // ARM encoding: cond=AL | 1111 | imm24=0x000042
-        //   = 0xEF000042
-        let program: Vec<u8> = [
-            0xE3A00005u32.to_le_bytes(), // MOV R0, #5  (at addr 0x00)
-            0xEF000042u32.to_le_bytes(), // SWI #0x42   (at addr 0x04)
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #5
-
-        // Before SWI: mode should be User (0x10)
-        assert_eq!(cpu.regs.cpu_mode(), 0x10, "Should be in User mode before SWI");
-
-        cpu.step(); // SWI #0x42
-
-        // After SWI:
-        // 1. Mode should be Supervisor (0x13)
-        assert_eq!(cpu.regs.cpu_mode(), 0x13, "Should switch to Supervisor mode");
-        // 2. LR should point to the instruction after SWI (0x04 + 4 = 0x08)
-        assert_eq!(cpu.regs.lr(), 0x08, "LR should be return address (next instr)");
-        // 3. IRQ should be disabled
-        assert!(cpu.regs.irq_disabled(), "IRQ should be disabled");
-        // 4. T flag should be clear (ARM mode)
-        assert!(!cpu.regs.is_thumb(), "Should be in ARM mode");
-        // 5. PC should be at SWI vector (0x08)
-        assert_eq!(cpu.regs.pc(), 0x08, "PC should jump to SWI vector 0x08");
-    }
-
-    #[test]
-    fn test_swi_preserves_spsr() {
-        // Verify that the original CPSR is saved into SPSR_svc
-        let program: Vec<u8> = [
-            0xE3A00001u32.to_le_bytes(), // MOV R0, #1
-            0xE3500001u32.to_le_bytes(), // CMP R0, #1  (sets Z flag)
-            0xEF000001u32.to_le_bytes(), // SWI #1
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #1
-        cpu.step(); // CMP R0, #1 → sets Z flag
-
-        // Capture CPSR before SWI (should have Z flag set + User mode)
-        let cpsr_before = cpu.regs.cpsr();
-        assert!(cpu.regs.flag_z(), "Z flag should be set before SWI");
-
-        cpu.step(); // SWI #1
-
-        // SPSR_svc should contain the pre-SWI CPSR
-        assert_eq!(cpu.regs.spsr_svc(), cpsr_before, "SPSR_svc should preserve original CPSR");
-        // Current CPSR should be different (SVC mode, IRQ disabled)
-        assert_ne!(cpu.regs.cpsr(), cpsr_before, "Current CPSR should differ after SWI");
-        assert_eq!(cpu.regs.cpu_mode(), 0x13, "Now in SVC mode");
-    }
-
-    #[test]
-    fn test_bios_sys_write() {
-        // Setup a sys_write (0x04) SWI
-        // R0 = 1 (stdout)
-        // R1 = 0x200 (string pointer)
-        // R2 = 5 ("Hello" length)
-        let program: Vec<u8> = [
-            0xE3A00001u32.to_le_bytes(), // MOV R0, #1
-            0xE3A01C02u32.to_le_bytes(), // MOV R1, #0x200
-            0xE3A02005u32.to_le_bytes(), // MOV R2, #5
-            0xEF000004u32.to_le_bytes(), // SWI #4
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        
-        // Write "Hello" to RAM at 0x200
-        cpu.mmu.write_u8(0x200, b'H');
-        cpu.mmu.write_u8(0x201, b'e');
-        cpu.mmu.write_u8(0x202, b'l');
-        cpu.mmu.write_u8(0x203, b'l');
-        cpu.mmu.write_u8(0x204, b'o');
-
-        // Step through MOVs
-        cpu.step(); // MOV R0
-        cpu.step(); // MOV R1
-        cpu.step(); // MOV R2
-
-        // Step SWI — this will set PC to 0x08, mode to SVC
-        let cpsr_before = cpu.regs.cpsr();
-        cpu.step();
-        assert_eq!(cpu.regs.pc(), 0x08, "PC should be at SWI vector");
-        assert_eq!(cpu.regs.cpu_mode(), 0x13, "Should be in SVC mode");
-
-        // Now step again — this should trigger handle_bios_syscall()
-        cpu.step();
-
-        // 1. R0 should contain the bytes written (5)
-        assert_eq!(cpu.regs.read(0), 5, "R0 should contain bytes written");
-        // 2. CPSR should be restored to pre-SWI state (User mode)
-        assert_eq!(cpu.regs.cpsr(), cpsr_before, "CPSR should be restored");
-        // 3. PC should be restored to next instruction (0x10)
-        assert_eq!(cpu.regs.pc(), 0x10, "PC should return from exception");
-    }
-
-    // ── BLX tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_blx_register() {
-        // BLX R0: branch to R0, save return addr in LR, switch mode if LSB=1
-        // BLX R0 = 0xE12FFF30
-        let program: Vec<u8> = [
-            0xE3A00F40u32.to_le_bytes(), // MOV R0, #256 (0x100)
-            0xE2800001u32.to_le_bytes(), // ADD R0, R0, #1 → R0 = 0x101
-            0xE12FFF30u32.to_le_bytes(), // BLX R0
-        ].concat();
-
-        let mut cpu = cpu_with_program(&program);
-        cpu.step(); // MOV R0, #256
-        cpu.step(); // ADD R0, R0, #1 → R0 = 0x101
-
-        let pc_before_blx = cpu.regs.pc(); // PC = 0x08 (addr of BLX = 0x08, after advance)
-        cpu.step(); // BLX R0
-
-        // PC should jump to 0x100 (LSB cleared)
-        assert_eq!(cpu.regs.pc(), 0x100, "PC should be 0x100");
-        // T flag should be set (Thumb mode, because R0 had LSB=1)
-        assert!(cpu.regs.is_thumb(), "T flag should be set");
-        // LR should contain the return address (next instruction after BLX)
-        // BLX was at addr 0x08, so return = 0x08 + 4 = 0x0C
-        assert_eq!(cpu.regs.lr(), pc_before_blx.wrapping_add(4), "LR should be return address");
-    }
-
-    // ── Halfword transfer tests ─────────────────────────────────────
-
-    #[test]
-    fn test_strh_stores_halfword() {
-        // STRH R0, [R1, #0]  (0xE1C100B0)
-        let program: Vec<u8> = [0xE1C100B0u32.to_le_bytes()].concat();
-        let mut cpu = cpu_with_program(&program);
-        cpu.regs.write(0, 0xBEEF); // value to store
-        cpu.regs.write(1, 0x200);  // base address
-        
-        cpu.step(); // Execute STRH
-
-        assert_eq!(cpu.mmu.read_u16(0x200), 0xBEEF, "Halfword should be stored");
-        assert_eq!(cpu.mmu.read_u8(0x202), 0, "Byte at +2 should be zero");
-    }
-
-    #[test]
-    fn test_ldrsh_sign_extends() {
-        // LDRSH R2, [R1, #0] (0xE1D120F0)
-        let program: Vec<u8> = [0xE1D120F0u32.to_le_bytes()].concat();
-        let mut cpu = cpu_with_program(&program);
-        cpu.regs.write(1, 0x200); // base address
-        cpu.mmu.write_u16(0x200, 0xFF80); // pre-load 0xFF80 (-128)
-
-        cpu.step(); // Execute LDRSH
-
-        // 0xFF80 as i16 = -128, sign-extended to 32 bits = 0xFFFFFF80
-        assert_eq!(cpu.regs.read(2), 0xFFFF_FF80, "LDRSH should sign-extend 0xFF80 to 0xFFFFFF80");
-    }
-
-    #[test]
-    fn test_ldrh_zero_extends() {
-        // LDRH R2, [R1, #0] (0xE1D120B0)
-        let program: Vec<u8> = [0xE1D120B0u32.to_le_bytes()].concat();
-        let mut cpu = cpu_with_program(&program);
-        cpu.regs.write(1, 0x200); // base address
-        cpu.mmu.write_u16(0x200, 0xFF80); // pre-load
-
-        cpu.step(); // Execute LDRH
-
-        assert_eq!(cpu.regs.read(2), 0x0000_FF80, "LDRH should zero-extend 0xFF80");
-    }
-
-    #[test]
-    fn test_ldrsb_sign_extends() {
-        // LDRSB R2, [R1, #0] (0xE1D120D0)
-        let program: Vec<u8> = [0xE1D120D0u32.to_le_bytes()].concat();
-        let mut cpu = cpu_with_program(&program);
-        cpu.regs.write(1, 0x200); // base address
-        cpu.mmu.write_u8(0x200, 0x80); // pre-load unsigned 0x80 (-128)
-
-        cpu.step(); // Execute LDRSB
-
-        assert_eq!(cpu.regs.read(2), 0xFFFF_FF80, "LDRSB should sign-extend 0x80 to 0xFFFFFF80");
-    }
-}
+mod tests;
 
