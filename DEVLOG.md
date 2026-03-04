@@ -1102,3 +1102,107 @@ volatile unsigned int * const AUDIO_FREQ = (unsigned int *)0x1000001C;
 - TypeScript: **0 errors** ✅
 - `theremin.bin` — 108 bytes, `_boot` at 0x8000 → `b _start` at 0x8004 ✅
 - **Live test: sound confirmed working in browser** 🔊 ✅
+
+---
+
+## Session 39 — Snake Game & Performance Optimization
+**Date:** 2026-03-04  
+**Role:** Game Developer / Performance Engineer
+
+### Goal
+Build a playable Snake game exercising all MMIO hardware (VRAM, keyboard, timer, audio), then diagnose and fix a cascade of performance and input issues that emerged during testing.
+
+### The Game: `snake.c`
+- **40×30 grid** on 800×600 VRAM (20px cells with 1px gap)
+- Arrow keys / WASD to steer, red food to eat, walls and self-collision = death
+- Eat sound (600 Hz, 5 frames), death sound (150 Hz, 30 frames) via APU MMIO
+- Game-over visual: entire snake turns red; press any arrow key to restart
+- Minimal libc stubs: `memmove`, `__aeabi_uidivmod` (O(32) binary long division)
+- Boot stub: `start.S` → `b _start`
+- Compiled binary: 67,948 bytes
+
+### Performance Bug Cascade (5 layers)
+Each fix revealed the next bottleneck — a classic onion-peeling debugging session:
+
+| # | Symptom | Root Cause | Fix |
+|---|---------|------------|-----|
+| 1 | **4 FPS** | `BATCH_SIZE = 500K` too small — `clear_screen()` alone needs 1.5M instructions | Increased to 5M |
+| 2 | **Still 4 FPS** | 5M individual `step_cpu()` JS→Wasm calls (~200ns overhead each = 1 second) | Created `run_batch(count, timer_interval)` — single Wasm call for entire batch |
+| 3 | **Still 4 FPS** | VSYNC spin loop (`while (timer == last) continue;`) burned 90% of budget — timer only ticked once per browser frame | Added `timer_interval` param: timer ticks every N instructions *inside* the batch |
+| 4 | **Still 4 FPS + freezes** | `clear_screen()` called every game tick: 480K pixels × 3 instructions × 25 ticks/batch = 35M needed, only 5M budget | **Rewrote to incremental rendering**: only draw/erase ~3 changed cells per tick |
+| 5 | **Snake unresponsive** | 5M instructions/batch = ~250ms blocking → key events queued during batch, missed by game loop | Reduced `BATCH_SIZE` to 200K (~10ms/batch → 60 FPS, keys process every frame) |
+
+### Key Input Fixes
+- **Keyboard events moved from canvas to `document`** — no longer requires canvas focus
+- **`KEY_CODE_MAP`**: `e.code` → keycode translation (ArrowUp→38, WASD→arrow equivalents)
+- **Deferred key release pattern**: `keyup` sets `pendingKeyRelease`, processed *after* batch execution so the CPU always sees the key for ≥1 full frame
+
+### Architecture: `run_batch()` (Rust/Wasm)
+```rust
+pub fn run_batch(count: u32, timer_interval: u32) -> u32 {
+    // Runs N instructions entirely inside Wasm (no JS boundary crossings)
+    // Ticks SYS_TIMER every timer_interval instructions
+    // Returns actual instructions executed (< count means CPU halted)
+}
+```
+- Eliminates JS→Wasm call overhead (~200ns × 5M = 1s → 0)
+- Internal timer prevents VSYNC spin loops from wasting budget
+- `BATCH_SIZE = 200_000`, `TIMER_INTERVAL = 200_000` → 1 timer tick per frame
+
+### Incremental Rendering Strategy
+**Before** (per game tick): `clear_screen()` → write all 480,000 pixels → redraw entire snake + food  
+**After** (per game tick): erase old tail (1 cell) + recolor old head (1 cell) + draw new head (1 cell)  
+**Result**: ~1,200 instructions/tick instead of ~1,400,000 — a **1,000× reduction**
+
+### Final Configuration
+| Parameter | Value | Effect |
+|-----------|-------|--------|
+| `BATCH_SIZE` | 200,000 | ~10ms per frame → 60 FPS |
+| `TIMER_INTERVAL` | 200,000 | 1 tick per browser frame |
+| `frame_skip` | 4 | Snake moves every 4th tick → 15 moves/sec |
+
+### Files Changed
+- **`snake.c`** (NEW) — Full Snake game with incremental rendering, restart, audio
+- **`start.S`** (existing) — Boot stub reused from theremin
+- **`src/lib.rs`** — Added `run_batch(count, timer_interval)` with internal timer ticking
+- **`src/main.ts`** — `BATCH_SIZE` 5M→200K, deferred key release, document-level keyboard, `run_batch` integration
+
+### Verification
+- `snake.bin` — 67,948 bytes, compiled with `-O2` ✅
+- 76 tests passing ✅
+- Snake game loads and renders in VRAM mode ✅
+
+---
+
+## Session 40 — Batch Engine Cleanup
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / WebAssembly Engineer
+
+### Goal
+Clean up the `run_batch` implementation and remove obsolete exports that were superseded by the batch execution engine.
+
+### Changes
+
+**`src/lib.rs`**
+- **`run_batch()`** — Replaced with cleaner implementation using `for i in 1..=count` loop and `i % timer_interval == 0` modulo-based timer ticking (replaces the previous `since_tick` counter approach)
+- **`execute_cycle()`** — **Removed**. Was only incrementing a counter without executing real CPU instructions; `run_batch` now handles all instruction execution and cycle counting
+- **`tick_sys_timer()`** — **Removed**. Timer ticking is now handled internally by `run_batch` every `timer_interval` instructions, eliminating the need for a separate JS-called export
+
+**`src/main.ts`**
+- Removed `execute_cycle` and `tick_sys_timer` imports
+- Removed stale `execute_cycle()` call from the render loop — `run_batch` is the sole execution path
+
+### API Surface (After)
+| Export | Purpose |
+|--------|---------|
+| `run_batch(count, timer_interval)` | Execute N instructions, tick timer every M — **the only execution entry point** |
+| `step_cpu()` | Single-step for debugger |
+| `send_key_event()` | Keyboard MMIO |
+| `send_touch_event()` | Touch/mouse MMIO |
+| `get_audio_ctrl()` / `get_audio_freq()` | Audio register readback |
+| `get_cpu_state()` | Debug panel JSON |
+
+### Verification
+- Wasm build: **success** (2.94s) ✅
+- TypeScript: **0 errors** ✅
+- `execute_cycle` and `tick_sys_timer` confirmed absent from `pkg/nekodroid.js` ✅

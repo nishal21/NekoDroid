@@ -277,6 +277,34 @@ pub fn step_cpu() -> bool {
     })
 }
 
+/// Runs the CPU for a specified number of instructions inside Wasm to avoid JS boundary overhead.
+/// Ticks the system timer every `timer_interval` instructions.
+/// Returns the actual number of instructions executed (will be less than `count` if halted).
+#[wasm_bindgen]
+pub fn run_batch(count: u32, timer_interval: u32) -> u32 {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(cpu) = borrow.as_mut() {
+            let mut executed = 0;
+            for i in 1..=count {
+                if !cpu.step() {
+                    break; // CPU halted
+                }
+                executed += 1;
+
+                // Tick the internal hardware timer
+                if i % timer_interval == 0 {
+                    cpu.mmu.sys_timer = cpu.mmu.sys_timer.wrapping_add(1);
+                }
+            }
+            CYCLE_COUNT.fetch_add(executed, Ordering::Relaxed);
+            executed
+        } else {
+            0
+        }
+    })
+}
+
 /// Loads a demo ARM program for debugging.
 /// This loads: MOV R0,#5 → MOV R1,#10 → ADD R2,R0,R1 → SUB R3,R2,#1 → CMP R3,#14 → loop back
 #[wasm_bindgen]
@@ -302,13 +330,6 @@ pub fn load_demo_program() {
             log("   MOV R0,#5 → MOV R1,#10 → ADD R2,R0,R1 → SUB R3,R2,#1 → CMP/BEQ logic");
         }
     });
-}
-
-/// Executes one CPU cycle, returns the new count.
-#[wasm_bindgen]
-pub fn execute_cycle() -> u32 {
-    let count = CYCLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    count
 }
 
 /// Returns the current cycle count.
@@ -346,17 +367,6 @@ pub fn send_key_event(keycode: i32, is_down: bool) {
     ARM_CPU.with(|cell| {
         if let Some(cpu) = cell.borrow_mut().as_mut() {
             cpu.mmu.key_state = if is_down { keycode as u32 } else { 0 };
-        }
-    });
-}
-
-/// Increments the system timer by 1 (called once per animation frame, ~60 Hz).
-/// ARM programs can read SYS_TIMER at 0x10000014 for timing/VSYNC.
-#[wasm_bindgen]
-pub fn tick_sys_timer() {
-    ARM_CPU.with(|cell| {
-        if let Some(cpu) = cell.borrow_mut().as_mut() {
-            cpu.mmu.sys_timer = cpu.mmu.sys_timer.wrapping_add(1);
         }
     });
 }

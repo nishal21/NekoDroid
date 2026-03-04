@@ -2,19 +2,18 @@ import './style.css';
 import init, {
   VirtualCPU,
   init_emulator,
-  execute_cycle,
   get_cycle_count,
   wasm_memory,
   send_touch_event,
   send_key_event,
   get_cpu_state,
   step_cpu,
+  run_batch,
   load_demo_program,
   load_custom_hex,
   load_rom,
   get_vram_ptr,
   get_vram_len,
-  tick_sys_timer,
   get_audio_ctrl,
   get_audio_freq,
 } from '../pkg/nekodroid.js';
@@ -204,7 +203,7 @@ async function main() {
     let mode: RenderMode = 'noise';
     let paused = false;
     let running = false;  // Continuous CPU execution mode
-    const BATCH_SIZE = 500000; // Instructions per frame in run mode
+    const BATCH_SIZE = 200_000; // Instructions per frame (~10ms at 20M ips → 60 FPS)
     let frameNumber = 0;
     let lastTime = performance.now();
     let fpsFrames = 0;
@@ -241,22 +240,14 @@ async function main() {
             break;
         }
 
-        // Execute a CPU cycle per frame
-        execute_cycle();
-
-        // Tick the system timer (~60 Hz VSYNC)
-        tick_sys_timer();
-
         // If running continuously, execute a batch of CPU instructions
+        // Timer ticks every TIMER_INTERVAL instructions inside the batch
+        // to prevent VSYNC-wait loops from burning the entire budget
         if (running) {
-          let halted = false;
-          for (let i = 0; i < BATCH_SIZE; i++) {
-            if (!step_cpu()) {
-              halted = true;
-              break;
-            }
-          }
-          if (halted) {
+          const TIMER_INTERVAL = BATCH_SIZE; // 1 tick per frame → snake frame_skip=4 → 15 moves/sec
+          const executed = run_batch(BATCH_SIZE, TIMER_INTERVAL);
+          if (executed < BATCH_SIZE) {
+            // CPU halted before finishing the batch
             running = false;
             const btnRun = document.getElementById('btn-run')!;
             btnRun.querySelector('.btn-icon')!.textContent = '▶️';
@@ -274,7 +265,11 @@ async function main() {
           addLog(`Touch UP at (${pendingRelease.x}, ${pendingRelease.y})`);
           pendingRelease = null;
         }
-
+        // Process deferred key release AFTER batch (ensures CPU sees key for \u22651 full frame)
+        if (pendingKeyRelease !== null) {
+          send_key_event(pendingKeyRelease, false);
+          pendingKeyRelease = null;
+        }
         // ── Audio sync: read CPU audio registers → Web Audio API ────
         if (isAudioInitialized && oscillator && audioCtx) {
           const ctrl = get_audio_ctrl();
@@ -414,15 +409,24 @@ async function main() {
       }
     });
 
-    // Keyboard input — canvas needs to be focusable
-    canvas.setAttribute('tabindex', '0');
-    canvas.addEventListener('keydown', (e) => {
-      e.preventDefault();
-      send_key_event(e.keyCode, true);
+    // Keyboard input — listen on document so it works without canvas focus
+    const KEY_CODE_MAP: Record<string, number> = {
+      ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+      KeyW: 38, KeyS: 40, KeyA: 37, KeyD: 39,
+      Space: 32, Enter: 13, Escape: 27,
+    };
+    let pendingKeyRelease: number | null = null;
+    document.addEventListener('keydown', (e) => {
+      const code = KEY_CODE_MAP[e.code] ?? e.keyCode;
+      if (code >= 37 && code <= 40) e.preventDefault(); // prevent page scroll on arrows
+      pendingKeyRelease = null; // cancel any pending release
+      send_key_event(code, true);
+      addLog(`\u2328\ufe0f Key DOWN: ${e.code} \u2192 ${code}`);
     });
-    canvas.addEventListener('keyup', (e) => {
-      e.preventDefault();
-      send_key_event(e.keyCode, false);
+    document.addEventListener('keyup', (e) => {
+      const code = KEY_CODE_MAP[e.code] ?? e.keyCode;
+      // Defer release to after batch so CPU sees the key for \u22651 full frame
+      pendingKeyRelease = code;
     });
 
     addLog('Input pipeline active: mouse + keyboard → Wasm', 'success');
