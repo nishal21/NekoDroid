@@ -12,6 +12,7 @@ import init, {
   load_demo_program,
   load_custom_hex,
   load_rom,
+  boot_linux_kernel,
   get_vram_ptr,
   get_vram_len,
   get_audio_ctrl,
@@ -139,6 +140,11 @@ app.innerHTML = `
         <input type="file" id="rom-file-input" accept=".bin" style="display: none;" />
         <button id="btn-upload-rom" class="debug-btn hex-upload-btn" style="background: linear-gradient(135deg, #4c1d95, #7c3aed); border-color: #a855f7;">
           <span class="btn-icon">💿</span> Select & Load .bin
+        </button>
+        <div class="linux-upload-header" style="margin-top: 10px; font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); letter-spacing: 0.15em;">BOOT LINUX KERNEL (.zImage / Image)</div>
+        <input type="file" id="linux-file-input" accept=".zImage,.bin,Image" style="display: none;" />
+        <button id="btn-upload-linux" class="debug-btn hex-upload-btn" style="background: linear-gradient(135deg, #059669, #10b981); border-color: #34d399;">
+          <span class="btn-icon">🐧</span> Boot Linux zImage
         </button>
       </div>
     </div>
@@ -623,6 +629,34 @@ async function main() {
       reader.readAsArrayBuffer(file);
       // Reset so the same file can be re-selected
       romFileInput.value = '';
+    });
+
+    // ── Linux kernel upload ────────────────────────────────────────
+    const linuxFileInput = document.getElementById('linux-file-input') as HTMLInputElement;
+    document.getElementById('btn-upload-linux')!.addEventListener('click', () => {
+      linuxFileInput.click();
+    });
+
+    linuxFileInput.addEventListener('change', () => {
+      const file = linuxFileInput.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const buffer = reader.result as ArrayBuffer;
+        const bytes = new Uint8Array(buffer);
+        const ok = boot_linux_kernel(bytes);
+        if (ok) {
+          setMode('vram', btnVram);
+          updateDebugPanel();
+          addLog(`🐧 Linux kernel boot prepared: ${file.name} (${bytes.length} bytes)`, 'success');
+          addLog('ATAG boot state configured, jumping to kernel at 0x8000', 'info');
+          console.log(`🐧 Linux boot sequence ready: ${file.name}, ${bytes.length} bytes`);
+        } else {
+          addLog('Failed to boot Linux kernel — is the emulator initialized?', 'system');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+      linuxFileInput.value = '';
     });
 
   } catch (err) {

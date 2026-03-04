@@ -450,3 +450,18 @@ pub fn load_rom(bytes: &[u8]) -> bool {
         }
     })
 }
+
+/// Loads and boots a Linux kernel zImage/Image.
+#[wasm_bindgen]
+pub fn boot_linux_kernel(bytes: &[u8]) -> bool {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(cpu) = borrow.as_mut() {
+            cpu.boot_linux(bytes, 0x0183);
+            CYCLE_COUNT.store(0, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    })
+}

@@ -1309,3 +1309,171 @@ Implement first-level ARMv7 short-descriptor translation so CPU memory accesses 
 - `cargo test test_mmu_section_translation -- --nocapture` ✅
 - `cargo test test_cp15_mrc_mcr -- --nocapture` ✅
 - `cargo test --lib --quiet` → **78 passed, 0 failed** ✅
+
+---
+
+## Session 43 — MMU Coarse L2 Tables (4KB Small Pages)
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / OS Architect
+
+### Goal
+Upgrade short-descriptor translation to support two-level Coarse Page Tables so virtual addresses can resolve through L1 type-1 descriptors to L2 small-page mappings.
+
+### Changes
+
+**`src/cpu.rs`**
+- Extended `translate_address()` with L1 descriptor type `0b01` handling (Coarse Page Table):
+  1. `l2_base = l1_desc & 0xFFFFFC00`
+  2. `l2_index = (vaddr >> 12) & 0xFF`
+  3. `l2_desc_addr = l2_base | (l2_index << 2)`
+  4. `l2_desc = mmu.read_u32(l2_desc_addr)` (physical table walk)
+  5. If L2 descriptor type is small page (`l2_desc & 3 == 2`):
+     - `phys_base = l2_desc & 0xFFFFF000`
+     - `offset = vaddr & 0xFFF`
+     - return `phys_base | offset`
+- Added explicit fault logging split by level:
+  - Unhandled L2 descriptor logs include L2 descriptor value + virtual address
+  - Unhandled L1 descriptor logs include L1 descriptor type + virtual address
+- Kept existing section mapping (`desc_type == 2`) behavior unchanged.
+
+### Tests
+
+**`src/cpu/tests.rs`**
+- Added `test_mmu_coarse_page_translation` with requested mapping:
+  - `TTBR0 = 0x20000`
+  - L1 coarse descriptor at `0x20000 + 0x2000`: `0x00030001` (L2 table @ `0x30000`)
+  - L2 small-page descriptor at `0x30004`: `0x00501002` (PA page @ `0x00501000`)
+  - MMU enabled with `SCTLR.M = 1`
+  - Verified translation: `0x80001004 -> 0x00501004`
+  - Verified routed write: `write_mem_u32(0x80001004, 0xCAFEBABE)` appears at physical `0x00501004`
+
+### Verification
+- `cargo test test_mmu_coarse_page_translation -- --nocapture` ✅
+- `cargo test test_mmu_section_translation -- --nocapture` ✅
+- `cargo test --lib --quiet` → **79 passed, 0 failed** ✅
+
+---
+
+## Session 44 — ARM Linux ATAG Boot Protocol
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / OS Architect
+
+### Goal
+Implement Linux ARM boot handoff via ATAG construction and register setup so a kernel image can be loaded with the expected entry state.
+
+### Changes
+
+**`src/cpu.rs`**
+- Added `boot_linux(&mut self, kernel_bytes: &[u8], machine_type: u32)`:
+  - Calls `reset()` first (clean CPU + MMU state)
+  - Builds ATAG list at physical `0x100`:
+    1. `ATAG_CORE` at `0x100` (`size=2`, `tag=0x54410001`)
+    2. `ATAG_MEM` at `0x108` (`size=4`, `tag=0x54410002`, RAM size, start addr `0x0`)
+    3. `ATAG_NONE` terminator
+  - Loads kernel bytes at `0x8000`
+  - Sets Linux-required boot registers:
+    - `R0 = 0`
+    - `R1 = machine_type`
+    - `R2 = 0x100` (ATAG base)
+    - `PC = 0x8000`
+- Added test-safe logging guard (`#[cfg(not(test))]`) for the Linux boot log message.
+
+**`src/lib.rs`**
+- Added wasm export `boot_linux_kernel(bytes: &[u8]) -> bool`:
+  - Calls `cpu.boot_linux(bytes, 0x0183)` (VersatilePB machine ID)
+  - Resets `CYCLE_COUNT`
+  - Returns success/failure based on CPU initialization state
+
+**`src/cpu/tests.rs`**
+- Added `test_boot_linux_atags`:
+  - Uses dummy kernel bytes (`MOV R0, #0`)
+  - Verifies boot register contract (`R0/R1/R2/PC`)
+  - Verifies ATAG memory words (`ATAG_CORE` and `ATAG_MEM` layout)
+
+### Verification
+- `cargo test test_boot_linux_atags -- --nocapture` ✅
+- `cargo test --lib --quiet` → **80 passed, 0 failed** ✅
+
+---
+
+## Session 45 — Linux zImage Upload UI
+**Date:** 2026-03-04  
+**Role:** Frontend UI Engineer
+
+### Goal
+Add a dedicated frontend flow to upload and boot an ARM Linux kernel image (`.zImage`/`Image`) using the new Wasm `boot_linux_kernel` entry point.
+
+### Changes
+
+**`src/main.ts`**
+- Updated Wasm imports to include `boot_linux_kernel`.
+- Added Linux upload controls in the debug upload panel:
+  - Header: `BOOT LINUX KERNEL (.zImage / Image)`
+  - Hidden input: `#linux-file-input` with `accept=".zImage,.bin,Image"`
+  - Button: `#btn-upload-linux` (green gradient, penguin icon)
+- Added Linux upload event flow:
+  - `#btn-upload-linux` click triggers hidden file input
+  - On file change:
+    1. reads file into `ArrayBuffer`
+    2. converts to `Uint8Array`
+    3. calls `boot_linux_kernel(bytes)`
+    4. switches render mode to `vram`
+    5. calls `updateDebugPanel()`
+    6. logs success to UI console and browser dev console
+  - Resets file input value so the same image can be selected again.
+
+### Verification
+- TypeScript diagnostics: **no errors** in `src/main.ts` ✅
+
+---
+
+## Session 46 — ARM Exception Infrastructure (UND/ABT/IRQ/FIQ)
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / ARM Architecture Expert
+
+### Goal
+Build exception-mode infrastructure and a universal exception entry path to support Linux-style handling of undefined instructions and memory faults, while preparing for IRQ/FIQ/high-vectors behavior.
+
+### Changes
+
+**`src/cpu.rs`**
+- Added complete ARM mode constants:
+  - `MODE_USER (0x10)`
+  - `MODE_FIQ (0x11)`
+  - `MODE_IRQ (0x12)`
+  - `MODE_SVC (0x13)`
+  - `MODE_ABT (0x17)`
+  - `MODE_UND (0x1B)`
+  - `MODE_SYS (0x1F)`
+
+- Expanded `RegisterFile` exception state:
+  - Added SPSR slots: `spsr_abt`, `spsr_und`, `spsr_irq`, `spsr_fiq` (existing `spsr_svc` retained)
+  - Added banked `R13/R14` pairs for `SVC/ABT/UND/IRQ/FIQ`
+  - Added mode switch banking logic in `set_cpsr()`:
+    - save outgoing mode `SP/LR`
+    - load incoming mode `SP/LR`
+  - Added helpers:
+    - `set_spsr(mode, val)`
+    - `spsr(mode)`
+    - `set_lr_banked(mode, addr)`
+
+- Added universal exception entry helper:
+  - `trigger_exception(exception_type, target_mode, vector_offset, pc_adjustment)`
+  - behavior:
+    1. saves CPSR to target mode SPSR
+    2. writes banked LR for target mode
+    3. switches mode, disables IRQ, optionally disables FIQ, forces ARM state
+    4. uses CP15 `SCTLR.V` (bit 13) for low (`0x00000000`) vs high (`0xFFFF0000`) vectors
+    5. branches to vector base + offset
+
+- Exception wiring updates:
+  - **SWI** now uses helper: `trigger_exception("SWI", MODE_SVC, 0x08, 4)`
+  - **Undefined instruction fallback** now routes to: `trigger_exception("Undefined Instruction", MODE_UND, 0x04, 4)`
+  - **MMU translation faults** now trigger **Data Abort**:
+    - `trigger_exception("Data Abort", MODE_ABT, 0x10, 8)`
+    - for both unhandled L1 and L2 descriptor cases
+
+- Added internal `exception_raised` guard in CPU memory wrappers to avoid executing memory reads/writes after an exception has already been taken during the current instruction.
+
+### Verification
+- `cargo test --lib --quiet` → **80 passed, 0 failed** ✅

@@ -21,7 +21,12 @@ const CPSR_MODE_MASK: u32 = 0x1F;
 
 // ARM CPU modes
 const MODE_USER: u32 = 0x10;  // User mode
-const MODE_SVC:  u32 = 0x13;  // Supervisor mode (SWI handler)
+const MODE_FIQ: u32  = 0x11;
+const MODE_IRQ: u32  = 0x12;
+const MODE_SVC: u32  = 0x13;  // Supervisor mode
+const MODE_ABT: u32  = 0x17;
+const MODE_UND: u32  = 0x1B;
+const MODE_SYS: u32  = 0x1F;
 
 // Exception vector addresses
 const SWI_VECTOR: u32 = 0x0000_0008;
@@ -46,6 +51,34 @@ pub struct RegisterFile {
     cpsr: u32,
     /// Saved Program Status Register (Supervisor mode)
     spsr_svc: u32,
+    /// Saved Program Status Register (Abort mode)
+    spsr_abt: u32,
+    /// Saved Program Status Register (Undefined mode)
+    spsr_und: u32,
+    /// Saved Program Status Register (IRQ mode)
+    spsr_irq: u32,
+    /// Saved Program Status Register (FIQ mode)
+    spsr_fiq: u32,
+    /// Banked R13 for SVC mode
+    banked_sp_svc: u32,
+    /// Banked R14 for SVC mode
+    banked_lr_svc: u32,
+    /// Banked R13 for ABT mode
+    banked_sp_abt: u32,
+    /// Banked R14 for ABT mode
+    banked_lr_abt: u32,
+    /// Banked R13 for UND mode
+    banked_sp_und: u32,
+    /// Banked R14 for UND mode
+    banked_lr_und: u32,
+    /// Banked R13 for IRQ mode
+    banked_sp_irq: u32,
+    /// Banked R14 for IRQ mode
+    banked_lr_irq: u32,
+    /// Banked R13 for FIQ mode
+    banked_sp_fiq: u32,
+    /// Banked R14 for FIQ mode
+    banked_lr_fiq: u32,
     /// Pipeline offset added when reading R15 as an operand.
     /// ARM mode: +4 (so R15 reads as instruction_addr + 8, since advance_pc already added 4)
     /// Thumb mode: +2 (so R15 reads as instruction_addr + 4, since advance_pc already added 2)
@@ -60,7 +93,73 @@ impl RegisterFile {
             regs: [0u32; 16],
             cpsr: MODE_USER, // Start in User mode
             spsr_svc: 0,
+            spsr_abt: 0,
+            spsr_und: 0,
+            spsr_irq: 0,
+            spsr_fiq: 0,
+            banked_sp_svc: 0,
+            banked_lr_svc: 0,
+            banked_sp_abt: 0,
+            banked_lr_abt: 0,
+            banked_sp_und: 0,
+            banked_lr_und: 0,
+            banked_sp_irq: 0,
+            banked_lr_irq: 0,
+            banked_sp_fiq: 0,
+            banked_lr_fiq: 0,
             pipeline_offset: 0,
+        }
+    }
+
+    fn save_banked_sp_lr(&mut self, mode: u32) {
+        match mode {
+            MODE_SVC => {
+                self.banked_sp_svc = self.regs[REG_SP];
+                self.banked_lr_svc = self.regs[REG_LR];
+            }
+            MODE_ABT => {
+                self.banked_sp_abt = self.regs[REG_SP];
+                self.banked_lr_abt = self.regs[REG_LR];
+            }
+            MODE_UND => {
+                self.banked_sp_und = self.regs[REG_SP];
+                self.banked_lr_und = self.regs[REG_LR];
+            }
+            MODE_IRQ => {
+                self.banked_sp_irq = self.regs[REG_SP];
+                self.banked_lr_irq = self.regs[REG_LR];
+            }
+            MODE_FIQ => {
+                self.banked_sp_fiq = self.regs[REG_SP];
+                self.banked_lr_fiq = self.regs[REG_LR];
+            }
+            _ => {}
+        }
+    }
+
+    fn load_banked_sp_lr(&mut self, mode: u32) {
+        match mode {
+            MODE_SVC => {
+                self.regs[REG_SP] = self.banked_sp_svc;
+                self.regs[REG_LR] = self.banked_lr_svc;
+            }
+            MODE_ABT => {
+                self.regs[REG_SP] = self.banked_sp_abt;
+                self.regs[REG_LR] = self.banked_lr_abt;
+            }
+            MODE_UND => {
+                self.regs[REG_SP] = self.banked_sp_und;
+                self.regs[REG_LR] = self.banked_lr_und;
+            }
+            MODE_IRQ => {
+                self.regs[REG_SP] = self.banked_sp_irq;
+                self.regs[REG_LR] = self.banked_lr_irq;
+            }
+            MODE_FIQ => {
+                self.regs[REG_SP] = self.banked_sp_fiq;
+                self.regs[REG_LR] = self.banked_lr_fiq;
+            }
+            _ => {}
         }
     }
 
@@ -125,6 +224,12 @@ impl RegisterFile {
 
     /// Sets the raw CPSR value.
     pub fn set_cpsr(&mut self, val: u32) {
+        let old_mode = self.cpu_mode();
+        let new_mode = val & CPSR_MODE_MASK;
+        if old_mode != new_mode {
+            self.save_banked_sp_lr(old_mode);
+            self.load_banked_sp_lr(new_mode);
+        }
         self.cpsr = val;
     }
 
@@ -197,7 +302,8 @@ impl RegisterFile {
 
     /// Sets the CPU mode (bits [4:0] of CPSR).
     pub fn set_cpu_mode(&mut self, mode: u32) {
-        self.cpsr = (self.cpsr & !CPSR_MODE_MASK) | (mode & CPSR_MODE_MASK);
+        let new_cpsr = (self.cpsr & !CPSR_MODE_MASK) | (mode & CPSR_MODE_MASK);
+        self.set_cpsr(new_cpsr);
     }
 
     /// Returns true if IRQ interrupts are disabled.
@@ -219,6 +325,46 @@ impl RegisterFile {
     pub fn set_spsr_svc(&mut self, val: u32) {
         self.spsr_svc = val;
     }
+
+    /// Sets SPSR for the provided target exception mode.
+    pub fn set_spsr(&mut self, target_mode: u32, val: u32) {
+        match target_mode {
+            MODE_SVC => self.spsr_svc = val,
+            MODE_ABT => self.spsr_abt = val,
+            MODE_UND => self.spsr_und = val,
+            MODE_IRQ => self.spsr_irq = val,
+            MODE_FIQ => self.spsr_fiq = val,
+            _ => {}
+        }
+    }
+
+    /// Reads SPSR for the provided mode.
+    pub fn spsr(&self, mode: u32) -> u32 {
+        match mode {
+            MODE_SVC => self.spsr_svc,
+            MODE_ABT => self.spsr_abt,
+            MODE_UND => self.spsr_und,
+            MODE_IRQ => self.spsr_irq,
+            MODE_FIQ => self.spsr_fiq,
+            _ => 0,
+        }
+    }
+
+    /// Writes LR in a specific banked mode without switching current CPU mode.
+    pub fn set_lr_banked(&mut self, target_mode: u32, addr: u32) {
+        if self.cpu_mode() == target_mode {
+            self.regs[REG_LR] = addr;
+            return;
+        }
+        match target_mode {
+            MODE_SVC => self.banked_lr_svc = addr,
+            MODE_ABT => self.banked_lr_abt = addr,
+            MODE_UND => self.banked_lr_und = addr,
+            MODE_IRQ => self.banked_lr_irq = addr,
+            MODE_FIQ => self.banked_lr_fiq = addr,
+            _ => self.regs[REG_LR] = addr,
+        }
+    }
 }
 
 // ── The CPU ───────────────────────────────────────────────────────────
@@ -236,6 +382,8 @@ pub struct Cpu {
     pub cp15: Cp15,
     /// Whether the CPU is halted
     pub halted: bool,
+    /// Set true when an exception is taken during an instruction.
+    exception_raised: bool,
 }
 
 impl Cpu {
@@ -246,6 +394,7 @@ impl Cpu {
             mmu: Mmu::new(ram_size),
             cp15: Cp15::new(),
             halted: false,
+            exception_raised: false,
         }
     }
 
@@ -256,6 +405,7 @@ impl Cpu {
             mmu: Mmu::default(),
             cp15: Cp15::new(),
             halted: false,
+            exception_raised: false,
         }
     }
 
@@ -265,6 +415,7 @@ impl Cpu {
         self.regs = RegisterFile::new();
         self.cp15 = Cp15::new();
         self.halted = false;
+        self.exception_raised = false;
         // Clear UART output buffer
         self.mmu.clear_uart_buffer();
         // Clear VRAM to black
@@ -275,8 +426,49 @@ impl Cpu {
         self.regs.set_pc(0x0000_8000);
     }
 
+    /// Prepares the CPU to boot an ARM Linux kernel using the ATAGs protocol.
+    pub fn boot_linux(&mut self, kernel_bytes: &[u8], machine_type: u32) {
+        self.reset();
+
+        let atag_base = 0x100u32;
+        let mut offset = 0u32;
+
+        // 1. ATAG_CORE
+        self.mmu.write_u32(atag_base + offset, 2);
+        self.mmu.write_u32(atag_base + offset + 4, 0x5441_0001);
+        offset += 8;
+
+        // 2. ATAG_MEM (RAM starts at 0x0)
+        self.mmu.write_u32(atag_base + offset, 4);
+        self.mmu.write_u32(atag_base + offset + 4, 0x5441_0002);
+        self.mmu.write_u32(atag_base + offset + 8, self.mmu.ram_size() as u32);
+        self.mmu.write_u32(atag_base + offset + 12, 0x0000_0000);
+        offset += 16;
+
+        // 3. ATAG_NONE
+        self.mmu.write_u32(atag_base + offset, 0);
+        self.mmu.write_u32(atag_base + offset + 4, 0x0000_0000);
+
+        // 4. Load kernel at 0x8000
+        self.load_program(0x8000, kernel_bytes);
+
+        // 5. Linux boot register contract
+        self.regs.write(0, 0);
+        self.regs.write(1, machine_type);
+        self.regs.write(2, atag_base);
+        self.regs.set_pc(0x8000);
+
+        #[cfg(not(test))]
+        {
+            crate::log(&format!(
+                "🐧 Prepared Linux boot. Machine ID: {:#X}, ATAGs at: {:#X}",
+                machine_type, atag_base
+            ));
+        }
+    }
+
     /// Translates a virtual address to a physical address using CP15 translation tables.
-    pub fn translate_address(&self, vaddr: u32) -> u32 {
+    pub fn translate_address(&mut self, vaddr: u32) -> u32 {
         // 1. MMU enable bit (SCTLR.M)
         if self.cp15.c1_sctlr & 1 == 0 {
             return vaddr;
@@ -301,48 +493,100 @@ impl Cpu {
             // Section mapping (1 MB): PA = descriptor[31:20] : VA[19:0]
             let phys_base = descriptor & 0xFFF0_0000;
             let offset = vaddr & 0x000F_FFFF;
-            phys_base | offset
+            return phys_base | offset;
+        } else if desc_type == 0b01 {
+            // Coarse Page Table mapping (Level 2 walk for 4KB pages)
+            // 1. Base of L2 table from L1 descriptor bits [31:10]
+            let l2_base = descriptor & 0xFFFF_FC00;
+
+            // 2. L2 index from VA[19:12]
+            let l2_index = (vaddr >> 12) & 0xFF;
+
+            // 3. Address of L2 descriptor
+            let l2_desc_addr = l2_base | (l2_index << 2);
+
+            // 4. Read L2 descriptor from physical memory
+            let l2_desc = self.mmu.read_u32(l2_desc_addr);
+
+            // 5. Small page descriptor type: bits [1:0] == 0b10
+            if (l2_desc & 0b11) == 0b10 {
+                let phys_base = l2_desc & 0xFFFF_F000;
+                let offset = vaddr & 0x0000_0FFF;
+                return phys_base | offset;
+            }
+
+            #[cfg(not(test))]
+            {
+                crate::log(&format!(
+                    "⚠️ MMU Fault: Unhandled L2 descriptor {:#010X} at vaddr {:#010X}",
+                    l2_desc, vaddr
+                ));
+            }
+            self.trigger_exception("Data Abort", MODE_ABT, 0x10, 8);
+            return vaddr;
         } else {
-            crate::log(&format!(
-                "⚠️ MMU Fault: Unhandled descriptor type {} at vaddr {:#010X}",
-                desc_type, vaddr
-            ));
-            vaddr
+            #[cfg(not(test))]
+            {
+                crate::log(&format!(
+                    "⚠️ MMU Fault: Unhandled L1 descriptor type {} at vaddr {:#010X}",
+                    desc_type, vaddr
+                ));
+            }
+            self.trigger_exception("Data Abort", MODE_ABT, 0x10, 8);
+            return vaddr;
         }
     }
 
-    pub fn read_mem_u8(&self, vaddr: u32) -> u8 {
+    pub fn read_mem_u8(&mut self, vaddr: u32) -> u8 {
         let paddr = self.translate_address(vaddr);
+        if self.exception_raised {
+            return 0;
+        }
         self.mmu.read_u8(paddr)
     }
 
     pub fn write_mem_u8(&mut self, vaddr: u32, val: u8) {
         let paddr = self.translate_address(vaddr);
+        if self.exception_raised {
+            return;
+        }
         self.mmu.write_u8(paddr, val);
     }
 
-    pub fn read_mem_u16(&self, vaddr: u32) -> u16 {
+    pub fn read_mem_u16(&mut self, vaddr: u32) -> u16 {
         let paddr = self.translate_address(vaddr);
+        if self.exception_raised {
+            return 0;
+        }
         self.mmu.read_u16(paddr)
     }
 
     pub fn write_mem_u16(&mut self, vaddr: u32, val: u16) {
         let paddr = self.translate_address(vaddr);
+        if self.exception_raised {
+            return;
+        }
         self.mmu.write_u16(paddr, val);
     }
 
-    pub fn read_mem_u32(&self, vaddr: u32) -> u32 {
+    pub fn read_mem_u32(&mut self, vaddr: u32) -> u32 {
         let paddr = self.translate_address(vaddr);
+        if self.exception_raised {
+            return 0;
+        }
         self.mmu.read_u32(paddr)
     }
 
     pub fn write_mem_u32(&mut self, vaddr: u32, val: u32) {
         let paddr = self.translate_address(vaddr);
+        if self.exception_raised {
+            return;
+        }
         self.mmu.write_u32(paddr, val);
     }
 
     /// Fetches the next instruction word from memory at the current PC.
-    pub fn fetch(&self) -> u32 {
+    pub fn fetch(&mut self) -> u32 {
         let pc = self.regs.pc();
         if self.regs.is_thumb() {
             self.read_mem_u16(pc) as u32
@@ -608,8 +852,43 @@ impl Cpu {
 
     /// Disassembles the instruction at the given memory address.
     pub fn disassemble_at(&self, addr: u32) -> String {
-        let instr = self.read_mem_u32(addr);
+        let instr = self.mmu.read_u32(addr);
         Self::disassemble_instruction(instr)
+    }
+
+    /// Triggers a hardware exception, switching modes and jumping to the vector table.
+    pub fn trigger_exception(&mut self, exception_type: &str, target_mode: u32, vector_offset: u32, pc_adjustment: u32) {
+        let cpsr = self.regs.cpsr();
+
+        // 1. Save CPSR to target mode SPSR
+        self.regs.set_spsr(target_mode, cpsr);
+
+        // 2. Save return address into target mode LR bank
+        let return_addr = self.regs.read(REG_PC).wrapping_sub(pc_adjustment);
+        self.regs.set_lr_banked(target_mode, return_addr);
+
+        // 3. Change mode, disable IRQ, optionally disable FIQ, force ARM state
+        let mut new_cpsr = (cpsr & !CPSR_MODE_MASK) | target_mode;
+        new_cpsr |= 0x80;
+        if target_mode == MODE_FIQ {
+            new_cpsr |= 0x40;
+        }
+        new_cpsr &= !(1 << 5);
+        self.regs.set_cpsr(new_cpsr);
+
+        // 4. Vector base from SCTLR.V (bit 13)
+        let high_vectors = (self.cp15.c1_sctlr & (1 << 13)) != 0;
+        let vector_base = if high_vectors { 0xFFFF_0000 } else { 0x0000_0000 };
+
+        // 5. Branch to vector
+        let vector = vector_base + vector_offset;
+        self.regs.set_pc(vector);
+        self.exception_raised = true;
+
+        #[cfg(not(test))]
+        {
+            crate::log(&format!("⚡ Exception: {} -> Jumped to {:#010X}", exception_type, vector));
+        }
     }
 
     // ── Fetch-Decode-Execute ──────────────────────────────────────────
@@ -620,6 +899,8 @@ impl Cpu {
         if self.halted {
             return false;
         }
+
+        self.exception_raised = false;
 
         // ── HLE BIOS Intercept ────────────────────────────────────────
         // If the PC has reached the SWI vector (0x08) AND we are in Supervisor mode,
@@ -1143,24 +1424,8 @@ impl Cpu {
 
     /// Executes a Software Interrupt (SWI / SVC) instruction.
     fn execute_swi(&mut self, instr: u32, pc_at_fetch: u32) {
-        let syscall_num = instr & 0x00FF_FFFF;
-
-        #[cfg(not(test))]
-        {
-            crate::log(&format!("\u{1F6A8} SWI executed: Syscall number 0x{:06X}", syscall_num));
-        }
-        #[cfg(test)]
-        {
-            let _ = syscall_num;
-        }
-
-        let saved_cpsr = self.regs.cpsr();
-        self.regs.set_spsr_svc(saved_cpsr);
-        self.regs.set_lr(pc_at_fetch.wrapping_add(4));
-        self.regs.set_cpu_mode(MODE_SVC);
-        self.regs.set_irq_disabled(true);
-        self.regs.set_thumb(false);
-        self.regs.set_pc(SWI_VECTOR);
+        let _ = (instr, pc_at_fetch);
+        self.trigger_exception("SWI", MODE_SVC, 0x08, 4);
     }
 
     // ── High-Level Emulation (HLE) BIOS ──────────────────────────────
@@ -1691,18 +1956,12 @@ impl Cpu {
 
     // ── Unimplemented handler ─────────────────────────────────────────
 
-    fn log_unimplemented(&self, category: &str, instr: u32, pc: u32) {
+    fn log_unimplemented(&mut self, category: &str, instr: u32, pc: u32) {
         #[cfg(not(test))]
         {
             let _ = (category, instr, pc);
         }
-        #[cfg(test)]
-        {
-            panic!(
-                "Unimplemented {} instruction: {:#010X} at PC {:#010X}",
-                category, instr, pc
-            );
-        }
+        self.trigger_exception("Undefined Instruction", MODE_UND, 0x04, 4);
     }
 }
 

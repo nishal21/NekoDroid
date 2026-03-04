@@ -1258,3 +1258,42 @@
         cpu.write_mem_u32(0x8000_0004, 0xCAFE_BABE);
         assert_eq!(cpu.mmu.read_u32(0x0010_0004), 0xCAFE_BABE);
     }
+
+    #[test]
+    fn test_mmu_coarse_page_translation() {
+        let mut cpu = Cpu::new(8 * 1024 * 1024); // 8 MB RAM to cover 0x0050_1000
+
+        // L1 translation table base
+        cpu.cp15.c2_ttbr0 = 0x0002_0000;
+
+        // L1 Coarse Table Descriptor for VA section 0x8000_0000 -> L2 table at 0x0003_0000
+        cpu.mmu.write_u32(0x0002_0000 + 0x2000, 0x0003_0001);
+
+        // L2 Small Page Descriptor for VA page index 0x1 -> PA 0x0050_1000
+        cpu.mmu.write_u32(0x0003_0004, 0x0050_1002);
+
+        // Enable MMU
+        cpu.cp15.c1_sctlr = 1;
+
+        assert_eq!(cpu.translate_address(0x8000_1004), 0x0050_1004);
+
+        cpu.write_mem_u32(0x8000_1004, 0xCAFE_BABE);
+        assert_eq!(cpu.mmu.read_u32(0x0050_1004), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn test_boot_linux_atags() {
+        let mut cpu = Cpu::new(16 * 1024 * 1024);
+        let dummy_kernel = [0x00, 0x00, 0xA0, 0xE3]; // MOV R0, #0
+
+        cpu.boot_linux(&dummy_kernel, 0x0183);
+
+        assert_eq!(cpu.regs.read(0), 0);
+        assert_eq!(cpu.regs.read(1), 0x0183);
+        assert_eq!(cpu.regs.read(2), 0x100);
+        assert_eq!(cpu.regs.pc(), 0x8000);
+
+        assert_eq!(cpu.mmu.read_u32(0x100), 2);
+        assert_eq!(cpu.mmu.read_u32(0x10C), 0x5441_0002);
+        assert_eq!(cpu.mmu.read_u32(0x110), 16 * 1024 * 1024);
+    }
