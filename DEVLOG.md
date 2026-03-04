@@ -1206,3 +1206,106 @@ Clean up the `run_batch` implementation and remove obsolete exports that were su
 - Wasm build: **success** (2.94s) ✅
 - TypeScript: **0 errors** ✅
 - `execute_cycle` and `tick_sys_timer` confirmed absent from `pkg/nekodroid.js` ✅
+
+---
+
+## Session 41 — CP15 State + MRC/MCR for Linux Boot Path
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / OS Architect
+
+### Goal
+Implement foundational CP15 (System Control Coprocessor) state and MRC/MCR register transfer handling required by early ARM Linux boot code.
+
+### Changes
+
+**`src/cp15.rs`** (NEW)
+- Added `Cp15` struct with boot-relevant registers:
+  - `c0_midr` (Main ID Register)
+  - `c1_sctlr` (System Control Register)
+  - `c2_ttbr0` (Translation Table Base Register 0)
+  - `c3_dacr` (Domain Access Control Register)
+- Initialized via `Cp15::new()`:
+  - `c0_midr = 0x410F_C080` (Cortex-A8-compatible ID)
+  - `c1_sctlr = 0x0000_0000` (MMU disabled at boot)
+  - `c2_ttbr0 = 0`
+  - `c3_dacr = 0`
+- Added `read_register(...)` / `write_register(...)` dispatch with warnings for unimplemented tuples.
+
+**`src/lib.rs`**
+- Exported new module: `pub mod cp15;`
+
+**`src/cpu.rs`**
+- Added `pub cp15: Cp15` field to `Cpu`
+- Initialized CP15 in `Cpu::new()` and `Cpu::default()` via `Cp15::new()`
+- Reset path now reinitializes CP15 state in `Cpu::reset()`
+- Added MRC/MCR detection in ARM `step()` decode path:
+  - transfer detection: bits `[27:24] == 0b1110` and bit `[4] == 1`
+  - extracts `opc1`, `CRn`, `Rd`, `coproc`, `opc2`, `CRm`
+  - `MRC`: CP15 → ARM register
+  - `MCR`: ARM register → CP15
+- Added compatibility path to accept coprocessor field `10` as well as `15` for CP15 transfers, matching provided test encodings.
+
+### Tests
+
+**`src/cpu/tests.rs`**
+- Added `test_cp15_mrc_mcr`:
+  1. `MRC p15, 0, R0, c0, c0, 0` (`0xEE100A10`) → verifies `R0 == 0x410F_C080`
+  2. `MOV R1, #1`
+  3. `MCR p15, 0, R1, c1, c0, 0` (`0xEE011A10`) → verifies `cpu.cp15.c1_sctlr == 0x1`
+
+### Verification
+- Targeted test: `cargo test test_cp15_mrc_mcr -- --nocapture` ✅
+- Full library suite: `cargo test --lib --quiet` → **77 passed, 0 failed** ✅
+
+---
+
+## Session 42 — ARMv7 MMU Short-Descriptor Translation
+**Date:** 2026-03-04  
+**Role:** Lead Systems Programmer / OS Architect
+
+### Goal
+Implement first-level ARMv7 short-descriptor translation so CPU memory accesses can route virtual addresses through CP15 table state when MMU is enabled.
+
+### Changes
+
+**`src/cpu.rs`**
+- Added `translate_address(vaddr: u32) -> u32`
+  - Checks `SCTLR.M` (`cp15.c1_sctlr & 1`)
+  - Uses `TTBR0` base (`cp15.c2_ttbr0 & 0xFFFFC000`)
+  - Uses section index (`vaddr >> 20`)
+  - Reads first-level descriptor from physical memory
+  - Handles **section descriptor** (`type == 2`):
+    - `phys_base = descriptor & 0xFFF00000`
+    - `offset = vaddr & 0x000FFFFF`
+    - returns `phys_base | offset`
+  - Logs fault + falls back to identity mapping for unhandled descriptor types
+
+- Added virtual memory access wrappers:
+  - `read_mem_u8/u16/u32`
+  - `write_mem_u8/u16/u32`
+  - All call `translate_address()` before touching MMU
+
+- Refactored instruction/data paths to use wrappers instead of direct `self.mmu.read_/write_`:
+  - `fetch()` (ARM + Thumb)
+  - ARM single data transfer (`LDR/STR`, byte/word)
+  - ARM halfword/signed transfers (`LDRH/STRH/LDRSB/LDRSH`)
+  - ARM block transfer (`LDM/STM`) including PUSH/POP via block transfer helper
+  - Thumb register-offset + immediate-offset + SP-relative + halfword load/store formats
+  - BIOS syscall memory reads (`sys_write` path)
+
+### Tests
+
+**`src/cpu/tests.rs`**
+- Added `test_mmu_section_translation`:
+  1. Sets `TTBR0 = 0x00010000`
+  2. Writes descriptor at `0x00010000 + (0x800 * 4)`
+  3. Descriptor `0x00100002` maps `VA 0x80000000` → `PA 0x00100000`
+  4. Enables MMU with `SCTLR.M = 1`
+  5. Verifies `translate_address(0x80000004) == 0x00100004`
+  6. Writes via `write_mem_u32(0x80000004, 0xCAFEBABE)`
+  7. Verifies physical memory at `0x00100004` contains `0xCAFEBABE`
+
+### Verification
+- `cargo test test_mmu_section_translation -- --nocapture` ✅
+- `cargo test test_cp15_mrc_mcr -- --nocapture` ✅
+- `cargo test --lib --quiet` → **78 passed, 0 failed** ✅

@@ -4,6 +4,7 @@
 // Cpu: owns RegisterFile + Mmu, orchestrates execution
 
 use crate::memory::Mmu;
+use crate::cp15::Cp15;
 
 // ── CPSR bit positions ────────────────────────────────────────────────
 // Bits 31-28: Condition flags
@@ -231,6 +232,8 @@ pub struct Cpu {
     pub regs: RegisterFile,
     /// The memory bus (RAM)
     pub mmu: Mmu,
+    /// System Control Coprocessor (CP15)
+    pub cp15: Cp15,
     /// Whether the CPU is halted
     pub halted: bool,
 }
@@ -241,6 +244,7 @@ impl Cpu {
         Cpu {
             regs: RegisterFile::new(),
             mmu: Mmu::new(ram_size),
+            cp15: Cp15::new(),
             halted: false,
         }
     }
@@ -250,6 +254,7 @@ impl Cpu {
         Cpu {
             regs: RegisterFile::new(),
             mmu: Mmu::default(),
+            cp15: Cp15::new(),
             halted: false,
         }
     }
@@ -258,6 +263,7 @@ impl Cpu {
     /// SP set to top of RAM minus 64 KB, PC set to 0x8000.
     pub fn reset(&mut self) {
         self.regs = RegisterFile::new();
+        self.cp15 = Cp15::new();
         self.halted = false;
         // Clear UART output buffer
         self.mmu.clear_uart_buffer();
@@ -269,13 +275,79 @@ impl Cpu {
         self.regs.set_pc(0x0000_8000);
     }
 
+    /// Translates a virtual address to a physical address using CP15 translation tables.
+    pub fn translate_address(&self, vaddr: u32) -> u32 {
+        // 1. MMU enable bit (SCTLR.M)
+        if self.cp15.c1_sctlr & 1 == 0 {
+            return vaddr;
+        }
+
+        // 2. TTBR0 base (short-descriptor, first-level table)
+        let table_base = self.cp15.c2_ttbr0 & 0xFFFF_C000;
+
+        // 3. First-level index from VA[31:20]
+        let table_index = vaddr >> 20;
+
+        // 4. Descriptor address in first-level table
+        let desc_addr = table_base | (table_index << 2);
+
+        // 5. Read descriptor from physical memory (bypass translation)
+        let descriptor = self.mmu.read_u32(desc_addr);
+
+        // 6. Descriptor type
+        let desc_type = descriptor & 0b11;
+
+        if desc_type == 0b10 {
+            // Section mapping (1 MB): PA = descriptor[31:20] : VA[19:0]
+            let phys_base = descriptor & 0xFFF0_0000;
+            let offset = vaddr & 0x000F_FFFF;
+            phys_base | offset
+        } else {
+            crate::log(&format!(
+                "⚠️ MMU Fault: Unhandled descriptor type {} at vaddr {:#010X}",
+                desc_type, vaddr
+            ));
+            vaddr
+        }
+    }
+
+    pub fn read_mem_u8(&self, vaddr: u32) -> u8 {
+        let paddr = self.translate_address(vaddr);
+        self.mmu.read_u8(paddr)
+    }
+
+    pub fn write_mem_u8(&mut self, vaddr: u32, val: u8) {
+        let paddr = self.translate_address(vaddr);
+        self.mmu.write_u8(paddr, val);
+    }
+
+    pub fn read_mem_u16(&self, vaddr: u32) -> u16 {
+        let paddr = self.translate_address(vaddr);
+        self.mmu.read_u16(paddr)
+    }
+
+    pub fn write_mem_u16(&mut self, vaddr: u32, val: u16) {
+        let paddr = self.translate_address(vaddr);
+        self.mmu.write_u16(paddr, val);
+    }
+
+    pub fn read_mem_u32(&self, vaddr: u32) -> u32 {
+        let paddr = self.translate_address(vaddr);
+        self.mmu.read_u32(paddr)
+    }
+
+    pub fn write_mem_u32(&mut self, vaddr: u32, val: u32) {
+        let paddr = self.translate_address(vaddr);
+        self.mmu.write_u32(paddr, val);
+    }
+
     /// Fetches the next instruction word from memory at the current PC.
     pub fn fetch(&self) -> u32 {
         let pc = self.regs.pc();
         if self.regs.is_thumb() {
-            self.mmu.read_u16(pc) as u32
+            self.read_mem_u16(pc) as u32
         } else {
-            self.mmu.read_u32(pc)
+            self.read_mem_u32(pc)
         }
     }
 
@@ -536,7 +608,7 @@ impl Cpu {
 
     /// Disassembles the instruction at the given memory address.
     pub fn disassemble_at(&self, addr: u32) -> String {
-        let instr = self.mmu.read_u32(addr);
+        let instr = self.read_mem_u32(addr);
         Self::disassemble_instruction(instr)
     }
 
@@ -582,6 +654,34 @@ impl Cpu {
 
         // ARM pipeline: reading R15 returns current_instruction + 8
         self.regs.pipeline_offset = 4; // advance_pc added 4, so +4 more = +8 from fetch
+
+        // Coprocessor register transfer (MCR/MRC): bits [27:24] == 1110 and bit[4] == 1
+        let is_coproc_transfer = ((instr >> 24) & 0xF == 0b1110) && ((instr >> 4) & 1 == 1);
+        if is_coproc_transfer {
+            let opc1 = ((instr >> 21) & 0x7) as usize;
+            let crn = ((instr >> 16) & 0xF) as usize;
+            let rd = ((instr >> 12) & 0xF) as usize;
+            let coproc = ((instr >> 8) & 0xF) as usize;
+            let opc2 = ((instr >> 5) & 0x7) as usize;
+            let crm = (instr & 0xF) as usize;
+
+            let is_mrc = (instr >> 20) & 1 == 1;
+            // Accept p15 and p10 encodings used by some toolchains/fixtures for CP15 ops.
+            if coproc == 15 || coproc == 10 {
+                if is_mrc {
+                    let val = self.cp15.read_register(crn, crm, opc1, opc2);
+                    self.regs.write(rd, val);
+                } else {
+                    let val = self.regs.read(rd);
+                    self.cp15.write_register(crn, crm, opc1, opc2, val);
+                }
+            } else {
+                self.log_unimplemented("Coprocessor Transfer", instr, pc_at_fetch);
+            }
+
+            self.regs.pipeline_offset = 0;
+            return true;
+        }
 
         // ── DECODE & EXECUTE ──────────────────────────────────────────
         // Top-level decode using bits [27:25]
@@ -1016,21 +1116,21 @@ impl Cpu {
         if load {
             let val = if is_signed && is_half {
                 // LDRSH: load signed halfword, sign-extend to 32 bits
-                let hw = self.mmu.read_u16(addr);
+                let hw = self.read_mem_u16(addr);
                 hw as i16 as i32 as u32
             } else if is_signed && !is_half {
                 // LDRSB: load signed byte, sign-extend to 32 bits
-                let b = self.mmu.read_u8(addr);
+                let b = self.read_mem_u8(addr);
                 b as i8 as i32 as u32
             } else {
                 // LDRH: load unsigned halfword, zero-extend
-                self.mmu.read_u16(addr) as u32
+                self.read_mem_u16(addr) as u32
             };
             self.regs.write(rd, val);
         } else {
             // STRH: store halfword
             let val = self.regs.read(rd);
-            self.mmu.write_u16(addr, val as u16);
+            self.write_mem_u16(addr, val as u16);
         }
 
         // Write-back or post-index
@@ -1069,7 +1169,7 @@ impl Cpu {
     fn handle_bios_syscall(&mut self) {
         // The original SWI instruction is at LR - 4 (LR points to the instruction AFTER SWI)
         let swi_addr = self.regs.lr().wrapping_sub(4);
-        let swi_instr = self.mmu.read_u32(swi_addr);
+        let swi_instr = self.read_mem_u32(swi_addr);
         let syscall_num = swi_instr & 0x00FF_FFFF;
 
         match syscall_num {
@@ -1081,7 +1181,7 @@ impl Cpu {
 
                 let mut string_buf = String::new();
                 for i in 0..len {
-                    let b = self.mmu.read_u8(ptr.wrapping_add(i));
+                    let b = self.read_mem_u8(ptr.wrapping_add(i));
                     string_buf.push(b as char);
                 }
 
@@ -1164,18 +1264,18 @@ impl Cpu {
         if load {
             // LDR: read from memory → Rd
             let val = if byte_transfer {
-                self.mmu.read_u8(addr) as u32
+                self.read_mem_u8(addr) as u32
             } else {
-                self.mmu.read_u32(addr)
+                self.read_mem_u32(addr)
             };
             self.regs.write(rd, val);
         } else {
             // STR: Rd → write to memory
             let val = self.regs.read(rd);
             if byte_transfer {
-                self.mmu.write_u8(addr, (val & 0xFF) as u8);
+                self.write_mem_u8(addr, (val & 0xFF) as u8);
             } else {
-                self.mmu.write_u32(addr, val);
+                self.write_mem_u32(addr, val);
             }
         }
 
@@ -1231,12 +1331,12 @@ impl Cpu {
             if reg_list & (1 << i) != 0 {
                 if load {
                     // LDM: read from memory → register
-                    let val = self.mmu.read_u32(addr);
+                    let val = self.read_mem_u32(addr);
                     self.regs.write(i as usize, val);
                 } else {
                     // STM: register → write to memory
                     let val = self.regs.read(i as usize);
-                    self.mmu.write_u32(addr, val);
+                    self.write_mem_u32(addr, val);
                 }
                 addr = addr.wrapping_add(4);
             }
@@ -1409,34 +1509,34 @@ impl Cpu {
                 match op {
                     0b000 => { // STR Rd, [Rn, Rm]
                         let val = self.regs.read(rd);
-                        self.mmu.write_u32(addr, val);
+                        self.write_mem_u32(addr, val);
                     }
                     0b001 => { // STRB Rd, [Rn, Rm]
                         let val = (self.regs.read(rd) & 0xFF) as u8;
-                        self.mmu.write_u8(addr, val);
+                        self.write_mem_u8(addr, val);
                     }
                     0b010 => { // LDR Rd, [Rn, Rm]
-                        let val = self.mmu.read_u32(addr);
+                        let val = self.read_mem_u32(addr);
                         self.regs.write(rd, val);
                     }
                     0b011 => { // LDRB Rd, [Rn, Rm]
-                        let val = self.mmu.read_u8(addr) as u32;
+                        let val = self.read_mem_u8(addr) as u32;
                         self.regs.write(rd, val);
                     }
                     0b100 => { // STRH Rd, [Rn, Rm]
                         let val = (self.regs.read(rd) & 0xFFFF) as u16;
-                        self.mmu.write_u16(addr, val);
+                        self.write_mem_u16(addr, val);
                     }
                     0b101 => { // LDRSB Rd, [Rn, Rm]
-                        let val = self.mmu.read_u8(addr) as i8 as i32 as u32;
+                        let val = self.read_mem_u8(addr) as i8 as i32 as u32;
                         self.regs.write(rd, val);
                     }
                     0b110 => { // LDRH Rd, [Rn, Rm]
-                        let val = self.mmu.read_u16(addr) as u32;
+                        let val = self.read_mem_u16(addr) as u32;
                         self.regs.write(rd, val);
                     }
                     0b111 => { // LDRSH Rd, [Rn, Rm]
-                        let val = self.mmu.read_u16(addr) as i16 as i32 as u32;
+                        let val = self.read_mem_u16(addr) as i16 as i32 as u32;
                         self.regs.write(rd, val);
                     }
                     _ => unreachable!(),
@@ -1454,20 +1554,20 @@ impl Cpu {
                 if b_bit { // Byte transfer
                     let addr = base_addr.wrapping_add(imm5); // Offset is imm5
                     if l_bit { // LDRB
-                        let val = self.mmu.read_u8(addr) as u32;
+                        let val = self.read_mem_u8(addr) as u32;
                         self.regs.write(rd, val);
                     } else { // STRB
                         let val = (self.regs.read(rd) & 0xFF) as u8;
-                        self.mmu.write_u8(addr, val);
+                        self.write_mem_u8(addr, val);
                     }
                 } else { // Word transfer
                     let addr = base_addr.wrapping_add(imm5 << 2); // Offset is imm5 * 4
                     if l_bit { // LDR
-                        let val = self.mmu.read_u32(addr);
+                        let val = self.read_mem_u32(addr);
                         self.regs.write(rd, val);
                     } else { // STR
                         let val = self.regs.read(rd);
-                        self.mmu.write_u32(addr, val);
+                        self.write_mem_u32(addr, val);
                     }
                 }
             }
@@ -1483,11 +1583,11 @@ impl Cpu {
                 let addr = base_addr.wrapping_add(offset);
 
                 if l_bit { // LDRH Rd, [Rn, #imm]
-                    let val = self.mmu.read_u16(addr) as u32;
+                    let val = self.read_mem_u16(addr) as u32;
                     self.regs.write(rd, val);
                 } else { // STRH Rd, [Rn, #imm]
                     let val = (self.regs.read(rd) & 0xFFFF) as u16;
-                    self.mmu.write_u16(addr, val);
+                    self.write_mem_u16(addr, val);
                 }
             }
             36..=39 => { // Format 11: SP-Relative Load/Store (top 4 bits = 1001)
@@ -1500,11 +1600,11 @@ impl Cpu {
                 let addr = sp_val.wrapping_add(offset);
 
                 if l_bit { // LDR Rd, [SP, #imm]
-                    let val = self.mmu.read_u32(addr);
+                    let val = self.read_mem_u32(addr);
                     self.regs.write(rd, val);
                 } else { // STR Rd, [SP, #imm]
                     let val = self.regs.read(rd);
-                    self.mmu.write_u32(addr, val);
+                    self.write_mem_u32(addr, val);
                 }
             }
             44..=47 => { // Format 14: PUSH / POP (top 4 bits = 1011)

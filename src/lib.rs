@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // ── CPU emulator modules ──────────────────────────────────────────────
 pub mod memory;
 pub mod cpu;
+pub mod cp15;
 
 // ── Browser bindings ──────────────────────────────────────────────────
 #[wasm_bindgen]

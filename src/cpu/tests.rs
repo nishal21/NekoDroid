@@ -1212,3 +1212,49 @@
         cpu.step(); // SUB → remainder
         assert_eq!(cpu.regs.read(3), 50, "450 % 200 should be 50");
     }
+
+    #[test]
+    fn test_cp15_mrc_mcr() {
+        // MRC p15,0,R0,c0,c0,0  -> 0xEE100A10 (read MIDR)
+        // MOV R1,#1             -> 0xE3A01001
+        // MCR p15,0,R1,c1,c0,0  -> 0xEE011A10 (write SCTLR)
+        let program: Vec<u8> = [
+            0xEE100A10u32.to_le_bytes(),
+            0xE3A01001u32.to_le_bytes(),
+            0xEE011A10u32.to_le_bytes(),
+        ]
+        .concat();
+
+        let mut cpu = cpu_with_program(&program);
+
+        cpu.step();
+        assert_eq!(cpu.regs.read(0), 0x410F_C080);
+
+        cpu.step();
+        assert_eq!(cpu.regs.read(1), 0x1);
+
+        cpu.step();
+        assert_eq!(cpu.cp15.c1_sctlr, 0x1);
+    }
+
+    #[test]
+    fn test_mmu_section_translation() {
+        let mut cpu = Cpu::new(2 * 1024 * 1024); // 2 MB RAM
+
+        // TTBR0 points to first-level translation table at 64 KB
+        cpu.cp15.c2_ttbr0 = 0x0001_0000;
+
+        // VA 0x8000_0000 uses first-level index 0x800
+        let desc_addr = 0x0001_0000 + (0x800 * 4);
+
+        // Section descriptor: map VA section 0x8000_0000 -> PA section 0x0010_0000
+        cpu.mmu.write_u32(desc_addr, 0x0010_0002);
+
+        // Enable MMU (SCTLR.M = bit 0)
+        cpu.cp15.c1_sctlr = 1;
+
+        assert_eq!(cpu.translate_address(0x8000_0004), 0x0010_0004);
+
+        cpu.write_mem_u32(0x8000_0004, 0xCAFE_BABE);
+        assert_eq!(cpu.mmu.read_u32(0x0010_0004), 0xCAFE_BABE);
+    }
