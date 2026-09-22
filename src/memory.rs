@@ -3,6 +3,8 @@
 // Flat byte-addressable RAM with little-endian read/write operations.
 // Includes Memory-Mapped I/O (MMIO) for hardware peripherals.
 
+use std::cell::{Cell, RefCell};
+
 /// Default RAM size: 16 MB (enough for basic ARM programs)
 const DEFAULT_RAM_SIZE: usize = 16 * 1024 * 1024;
 
@@ -75,12 +77,33 @@ const MMC_REG_CTRL: u32 = 0x14;     // Control
 // MMC Commands
 const MMC_CMD_READ_SINGLE: u32 = 17;  // CMD17: READ_SINGLE_BLOCK
 const MMC_CMD_READ_MULTIPLE: u32 = 18; // CMD18: READ_MULTIPLE_BLOCK
+const MMC_CMD_STOP_TRANSMISSION: u32 = 12; // CMD12: STOP_TRANSMISSION
 #[allow(dead_code)]
 const MMC_CMD_WRITE_SINGLE: u32 = 24; // CMD24: WRITE_SINGLE_BLOCK
 const MMC_CMD_SEND_STATUS: u32 = 13;  // CMD13: SEND_STATUS
 const MMC_CMD_APP_CMD: u32 = 55;      // CMD55: APP_CMD
 #[allow(dead_code)]
 const MMC_CMD_SD_SEND_OP_COND: u32 = 41; // ACMD41: SD_SEND_OP_COND
+
+// Goldfish Pipe (QEMU-compatible register subset)
+const PIPE_REG_COMMAND: u32 = 0x00;
+const PIPE_REG_STATUS: u32 = 0x04;
+const PIPE_REG_CHANNEL: u32 = 0x08;
+const PIPE_REG_SIZE: u32 = 0x0c;
+const PIPE_REG_ADDRESS: u32 = 0x10;
+const PIPE_REG_WAKES: u32 = 0x14;
+const PIPE_REG_VERSION: u32 = 0x20;
+
+const PIPE_CMD_OPEN: u32 = 1;
+const PIPE_CMD_CLOSE: u32 = 2;
+const PIPE_CMD_POLL: u32 = 3;
+const PIPE_CMD_WRITE: u32 = 4;
+const PIPE_CMD_READ: u32 = 5;
+
+const PIPE_ERROR_INVAL: i32 = -1;
+const PIPE_ERROR_AGAIN: i32 = -2;
+const PIPE_POLL_IN: u32 = 1;
+const PIPE_POLL_OUT: u32 = 2;
 
 // Android Logger (logcat) interface
 const ANDROID_LOG_BASE: u32 = 0x1E00_0000;
@@ -195,12 +218,26 @@ pub struct Mmu {
     /// MMC data register (for sector reads)
     pub mmc_data: u32,
     /// Current sector being read
-    pub mmc_current_sector: u32,
+    pub mmc_current_sector: Cell<u32>,
     /// Sector data buffer (512 bytes for standard sector)
-    pub mmc_sector_buffer: [u8; 512],
+    pub mmc_sector_buffer: RefCell<[u8; 512]>,
     /// Byte offset within sector buffer
-    pub mmc_buffer_offset: usize,
-    
+    pub mmc_buffer_offset: Cell<usize>,
+    /// CMD18 multi-block transfer active until CMD12
+    pub mmc_multi_active: Cell<bool>,
+
+    // ── Goldfish Pipe ────────────────────────────────────────────────
+    pub pipe_cmd: u32,
+    pub pipe_status: i32,
+    pub pipe_channel: u32,
+    pub pipe_size: u32,
+    pub pipe_address: u32,
+    pub pipe_wakes: u32,
+    /// Opened pipe channels (id -> service name)
+    pub pipe_channels: Vec<String>,
+    /// Host→guest scratch for pipe reads (e.g. ping replies)
+    pub pipe_rx: Vec<u8>,
+
     // ── Android Logger ────────────────────────────────────────────────
     /// Logger device read position
     pub logger_read_pos: usize,
@@ -308,9 +345,19 @@ impl Mmu {
             mmc_resp: 0,
             mmc_status: 0,
             mmc_data: 0,
-            mmc_current_sector: 0,
-            mmc_sector_buffer: [0u8; 512],
-            mmc_buffer_offset: 0,
+            mmc_current_sector: Cell::new(0),
+            mmc_sector_buffer: RefCell::new([0u8; 512]),
+            mmc_buffer_offset: Cell::new(0),
+            mmc_multi_active: Cell::new(false),
+            // Goldfish Pipe
+            pipe_cmd: 0,
+            pipe_status: 0,
+            pipe_channel: 0,
+            pipe_size: 0,
+            pipe_address: 0,
+            pipe_wakes: 0,
+            pipe_channels: Vec::new(),
+            pipe_rx: Vec::new(),
             // Android Logger fields
             logger_read_pos: 0,
             logger_max_entries: 1024,
@@ -464,46 +511,175 @@ impl Mmu {
         let arg = self.mmc_arg; // Sector address
 
         match cmd {
+            MMC_CMD_STOP_TRANSMISSION => {
+                self.mmc_multi_active.set(false);
+                self.mmc_resp = 0;
+            }
             MMC_CMD_READ_SINGLE => {
-                // CMD17: Read single block (512 bytes)
-                self.load_mmc_sector(arg, false);
+                self.mmc_multi_active.set(false);
+                self.load_mmc_sector_cmd(arg);
             }
             MMC_CMD_READ_MULTIPLE => {
-                // CMD18: Read multiple — load first sector; guest may advance ARG and re-issue
-                // or call again with next LBA. We keep the sector buffer filled for sequential use.
-                self.load_mmc_sector(arg, true);
+                self.mmc_multi_active.set(true);
+                self.load_mmc_sector_cmd(arg);
             }
             MMC_CMD_SEND_STATUS => {
-                // CMD13: Send status - return card status
                 self.mmc_resp = if self.mmc_card_data.is_some() { 0x00000001 } else { 0x00000000 };
             }
             MMC_CMD_APP_CMD => {
-                // CMD55: Application command prefix - acknowledge
                 self.mmc_resp = 0;
             }
             _ => {
-                // Unknown command - return error
                 self.mmc_resp = 0x80000000; // Error flag
             }
         }
     }
 
-    fn load_mmc_sector(&mut self, arg: u32, _multi: bool) {
-        self.mmc_current_sector = arg;
-        self.mmc_buffer_offset = 0;
+    fn load_mmc_sector(&self, arg: u32) {
+        self.mmc_current_sector.set(arg);
+        self.mmc_buffer_offset.set(0);
+        let mut buf = self.mmc_sector_buffer.borrow_mut();
         if let Some(ref card_data) = self.mmc_card_data {
             let sector_offset = (arg as usize) * 512;
             if sector_offset + 512 <= card_data.len() {
-                self.mmc_sector_buffer
-                    .copy_from_slice(&card_data[sector_offset..sector_offset + 512]);
-                self.mmc_resp = 0;
+                buf.copy_from_slice(&card_data[sector_offset..sector_offset + 512]);
+                // resp updated via Cell-less field — only safe from &mut callers;
+                // for &self auto-advance we leave resp at 0 on success.
             } else {
-                self.mmc_sector_buffer.fill(0);
-                self.mmc_resp = 0x80000000;
+                buf.fill(0);
+                self.mmc_multi_active.set(false);
             }
         } else {
-            self.mmc_sector_buffer.fill(0);
+            buf.fill(0);
+            self.mmc_multi_active.set(false);
+        }
+        drop(buf);
+    }
+
+    fn load_mmc_sector_cmd(&mut self, arg: u32) {
+        self.load_mmc_sector(arg);
+        if let Some(ref card_data) = self.mmc_card_data {
+            let sector_offset = (arg as usize) * 512;
+            if sector_offset + 512 <= card_data.len() {
+                self.mmc_resp = 0;
+            } else {
+                self.mmc_resp = 0x80000000;
+                self.mmc_multi_active.set(false);
+            }
+        } else {
             self.mmc_resp = 0x80000000;
+            self.mmc_multi_active.set(false);
+        }
+    }
+
+    /// Reads 4 bytes from the MMC data port, advancing the sector buffer.
+    /// Under CMD18, auto-loads the next LBA when a sector is fully consumed.
+    fn read_mmc_data_word(&self) -> u32 {
+        let offset = self.mmc_buffer_offset.get();
+        if offset >= 512 {
+            return 0;
+        }
+        let word = {
+            let buf = self.mmc_sector_buffer.borrow();
+            let b0 = buf[offset] as u32;
+            let b1 = buf.get(offset + 1).copied().unwrap_or(0) as u32;
+            let b2 = buf.get(offset + 2).copied().unwrap_or(0) as u32;
+            let b3 = buf.get(offset + 3).copied().unwrap_or(0) as u32;
+            b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        };
+        self.mmc_buffer_offset.set(offset + 4);
+
+        if self.mmc_buffer_offset.get() >= 512 && self.mmc_multi_active.get() {
+            let next = self.mmc_current_sector.get().wrapping_add(1);
+            self.load_mmc_sector(next);
+        }
+        word
+    }
+
+    fn execute_pipe_command(&mut self) {
+        match self.pipe_cmd {
+            PIPE_CMD_OPEN => {
+                let len = self.pipe_size.min(256) as usize;
+                let mut name = String::new();
+                for i in 0..len {
+                    let b = self.read_u8(self.pipe_address.wrapping_add(i as u32));
+                    if b == 0 {
+                        break;
+                    }
+                    name.push(b as char);
+                }
+                if name.is_empty() {
+                    self.pipe_status = PIPE_ERROR_INVAL;
+                } else {
+                    self.pipe_channels.push(name);
+                    self.pipe_channel = self.pipe_channels.len() as u32; // 1-based id
+                    self.pipe_status = 0;
+                    self.pipe_wakes = PIPE_POLL_OUT;
+                }
+            }
+            PIPE_CMD_CLOSE => {
+                let id = self.pipe_channel as usize;
+                if id == 0 || id > self.pipe_channels.len() {
+                    self.pipe_status = PIPE_ERROR_INVAL;
+                } else {
+                    self.pipe_channels[id - 1].clear();
+                    self.pipe_status = 0;
+                    self.pipe_wakes = 0;
+                }
+            }
+            PIPE_CMD_POLL => {
+                let id = self.pipe_channel as usize;
+                if id == 0 || id > self.pipe_channels.len() || self.pipe_channels[id - 1].is_empty() {
+                    self.pipe_status = PIPE_ERROR_INVAL;
+                } else {
+                    let mut wake = PIPE_POLL_OUT;
+                    if !self.pipe_rx.is_empty() {
+                        wake |= PIPE_POLL_IN;
+                    }
+                    self.pipe_wakes = wake;
+                    self.pipe_status = 0;
+                }
+            }
+            PIPE_CMD_WRITE => {
+                // Host accepts guest writes; ping services get a canned reply.
+                let id = self.pipe_channel as usize;
+                if id == 0 || id > self.pipe_channels.len() || self.pipe_channels[id - 1].is_empty() {
+                    self.pipe_status = PIPE_ERROR_INVAL;
+                    return;
+                }
+                let len = self.pipe_size.min(4096) as usize;
+                let mut buf = vec![0u8; len];
+                for i in 0..len {
+                    buf[i] = self.read_u8(self.pipe_address.wrapping_add(i as u32));
+                }
+                let svc = self.pipe_channels[id - 1].as_str();
+                if svc.contains("qemud") || svc.contains("pipe") {
+                    self.pipe_rx.extend_from_slice(b"ok\n");
+                    self.pipe_wakes = PIPE_POLL_IN | PIPE_POLL_OUT;
+                }
+                let _ = buf;
+                self.pipe_status = 0;
+            }
+            PIPE_CMD_READ => {
+                let want = self.pipe_size.min(4096) as usize;
+                if self.pipe_rx.is_empty() {
+                    self.pipe_status = PIPE_ERROR_AGAIN;
+                    return;
+                }
+                let n = want.min(self.pipe_rx.len());
+                let chunk: Vec<u8> = self.pipe_rx.drain(..n).collect();
+                for (i, b) in chunk.iter().enumerate() {
+                    self.write_u8(self.pipe_address.wrapping_add(i as u32), *b);
+                }
+                self.pipe_size = n as u32;
+                self.pipe_status = 0;
+                if self.pipe_rx.is_empty() {
+                    self.pipe_wakes = PIPE_POLL_OUT;
+                }
+            }
+            _ => {
+                self.pipe_status = PIPE_ERROR_INVAL;
+            }
         }
     }
 
@@ -686,25 +862,14 @@ impl Mmu {
                     MMC_REG_ARG => self.mmc_arg,
                     MMC_REG_RESP => self.mmc_resp,
                     MMC_REG_STATUS => {
-                        // Status: bit0=card present, bit1=ready, bit2=busy, bit3=data available
+                        // bit0=present, bit1=ready, bit2=data avail, bit3=multi active
                         let card_present = if self.mmc_card_data.is_some() { 1 } else { 0 };
                         let ready = if self.mmc_card_data.is_some() { 1 } else { 0 };
-                        let data_avail = if self.mmc_buffer_offset < 512 { 1 } else { 0 };
-                        (card_present) | (ready << 1) | (data_avail << 3)
+                        let data_avail = if self.mmc_buffer_offset.get() < 512 { 1 } else { 0 };
+                        let multi = if self.mmc_multi_active.get() { 1 } else { 0 };
+                        card_present | (ready << 1) | (data_avail << 2) | (multi << 3)
                     }
-                    MMC_REG_DATA => {
-                        // Return next byte from sector buffer as 32-bit word
-                        if self.mmc_buffer_offset < 512 {
-                            let offset = self.mmc_buffer_offset;
-                            let b0 = self.mmc_sector_buffer[offset] as u32;
-                            let b1 = self.mmc_sector_buffer.get(offset + 1).copied().unwrap_or(0) as u32;
-                            let b2 = self.mmc_sector_buffer.get(offset + 2).copied().unwrap_or(0) as u32;
-                            let b3 = self.mmc_sector_buffer.get(offset + 3).copied().unwrap_or(0) as u32;
-                            b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-                        } else {
-                            0
-                        }
-                    }
+                    MMC_REG_DATA => self.read_mmc_data_word(),
                     MMC_REG_CTRL => 0, // Control register - stub
                     _ => 0,
                 };
@@ -724,12 +889,17 @@ impl Mmu {
                     _ => 0,
                 };
             }
-            // Goldfish Pipe - probe returns a simple status magic so kernels see a live device
+            // Goldfish Pipe — QEMU-compatible probe + open/close/poll/rw
             if addr >= GOLDFISH_PIPE_BASE && addr < GOLDFISH_PIPE_BASE + GOLDFISH_PIPE_SIZE {
                 let off = addr - GOLDFISH_PIPE_BASE;
                 return match off {
-                    0x00 => 0x5049_5045, // 'PIPE' magic
-                    0x04 => 1,           // version
+                    PIPE_REG_COMMAND => self.pipe_cmd,
+                    PIPE_REG_STATUS => self.pipe_status as u32,
+                    PIPE_REG_CHANNEL => self.pipe_channel,
+                    PIPE_REG_SIZE => self.pipe_size,
+                    PIPE_REG_ADDRESS => self.pipe_address,
+                    PIPE_REG_WAKES => self.pipe_wakes,
+                    PIPE_REG_VERSION => 1,
                     _ => 0,
                 };
             }
@@ -961,6 +1131,23 @@ impl Mmu {
                         MMC_REG_CTRL => { /* Control register - no operation */ }
                         _ => {}
                     }
+                    return;
+                }
+                // Goldfish Pipe
+                if addr >= GOLDFISH_PIPE_BASE && addr < GOLDFISH_PIPE_BASE + GOLDFISH_PIPE_SIZE {
+                    let off = addr - GOLDFISH_PIPE_BASE;
+                    match off {
+                        PIPE_REG_COMMAND => {
+                            self.pipe_cmd = val;
+                            self.execute_pipe_command();
+                        }
+                        PIPE_REG_CHANNEL => self.pipe_channel = val,
+                        PIPE_REG_SIZE => self.pipe_size = val,
+                        PIPE_REG_ADDRESS => self.pipe_address = val,
+                        PIPE_REG_WAKES => self.pipe_wakes = val,
+                        _ => {}
+                    }
+                    return;
                 }
                 // Goldfish RTC - update time
                 if addr >= GOLDFISH_RTC_BASE && addr < GOLDFISH_RTC_BASE + 0x1000 {
@@ -969,6 +1156,7 @@ impl Mmu {
                         0x04 => self.goldfish_rtc = (self.goldfish_rtc & 0x00000000_FFFFFFFF) | ((val as u64) << 32),
                         _ => {}
                     }
+                    return;
                 }
                 // Android Logger (logcat) - write log entry
                 if addr >= ANDROID_LOG_BASE && addr < ANDROID_LOG_BASE + ANDROID_LOG_SIZE {

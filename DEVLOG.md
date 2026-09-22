@@ -1969,3 +1969,20 @@ char* msg = "Application started";
 - User commits with allowlist
 - Optional goldfish kernel smoke via gitignored `test-images/`
 
+---
+
+## Session 55 — Goldfish Pipe + MMC deepen + more Dalvik
+
+### Done
+- Goldfish Pipe MMIO: VERSION/OPEN/CLOSE/POLL/WRITE/READ (QEMU-ish regs)
+- MMC: DATA port advances; CMD18 auto-next-LBA; CMD12 stop
+- Optional `test_optional_goldfish_zimage_smoke` (skips without test-images/)
+- Dalvik: check-cast, new-array, aget/aput, array-length, add/sub/mul-int (+2addr)
+- Docs: `docs/GOLDFISH_SMOKE.md`, OPCODE_MVP updated
+- `cargo test --lib` → 124 passed
+
+### Next
+- Drop real zImage under gitignored test-images/ and exercise UI boot
+- More Binder/ASHMEM realism as goldfish boot needs it
+- Richer HLE fixtures beyond hello.apk
+

@@ -16,6 +16,7 @@ pub struct HleHost {
 pub enum HleObject {
     String(String),
     Instance { class: String, fields: Vec<(u32, Value)> },
+    Array { len: i32, elems: Vec<Value> },
     Null,
 }
 
@@ -47,6 +48,52 @@ impl HleHost {
             fields: Vec::new(),
         });
         Value::Obj(self.objects.len() as u32)
+    }
+
+    pub fn alloc_array(&mut self, len: i32) -> Value {
+        let n = len.max(0) as usize;
+        self.objects.push(HleObject::Array {
+            len,
+            elems: vec![Value::Int(0); n],
+        });
+        Value::Obj(self.objects.len() as u32)
+    }
+
+    pub fn array_len(&self, v: Value) -> Option<i32> {
+        match v {
+            Value::Obj(0) | Value::Int(_) => None,
+            Value::Obj(i) => match self.objects.get((i - 1) as usize) {
+                Some(HleObject::Array { len, .. }) => Some(*len),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn array_get(&self, arr: Value, idx: i32) -> Option<Value> {
+        match arr {
+            Value::Obj(0) | Value::Int(_) => None,
+            Value::Obj(i) => match self.objects.get((i - 1) as usize) {
+                Some(HleObject::Array { elems, .. }) => elems.get(idx as usize).copied(),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn array_set(&mut self, arr: Value, idx: i32, val: Value) -> bool {
+        match arr {
+            Value::Obj(0) | Value::Int(_) => false,
+            Value::Obj(i) => match self.objects.get_mut((i - 1) as usize) {
+                Some(HleObject::Array { elems, .. }) => {
+                    if let Some(slot) = elems.get_mut(idx as usize) {
+                        *slot = val;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            },
+        }
     }
 
     pub fn get_string(&self, v: Value) -> Option<&str> {

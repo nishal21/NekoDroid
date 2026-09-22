@@ -31,7 +31,7 @@
 
     #[test]
     fn test_out_of_bounds_reads_zero() {
-        let mmu = Mmu::new(256);
+        let mut mmu = Mmu::new(256);
         // Reading past RAM size should return 0, not panic
         assert_eq!(mmu.read_u8(0x1000), 0);
         assert_eq!(mmu.read_u16(0x1000), 0);
@@ -69,7 +69,7 @@
 
     #[test]
     fn test_uart_rx_returns_zero() {
-        let mmu = Mmu::new(256);
+        let mut mmu = Mmu::new(256);
         assert_eq!(mmu.read_u8(0x1000_0004), 0);
         assert_eq!(mmu.read_u32(0x1000_0004), 0);
     }
@@ -90,7 +90,7 @@
 
     #[test]
     fn test_vpb_uartfr_returns_not_full() {
-        let mmu = Mmu::new(256);
+        let mut mmu = Mmu::new(256);
         assert_eq!(mmu.read_u32(0x101F_1018), 0);
     }
 
@@ -407,7 +407,7 @@
 
     #[test]
     fn test_binder_version() {
-        let mmu = Mmu::new(256);
+        let mut mmu = Mmu::new(256);
 
         // Binder protocol version should be 1 (at 0x0A00_0000)
         assert_eq!(mmu.read_u32(0x0A00_0000), 0x00000001);
@@ -594,4 +594,95 @@
 
         // Region 1 should have been purged (unpinned)
         assert!(mmu.ashmem_regions[1].data.is_empty());
+    }
+
+    #[test]
+    fn test_mmc_data_port_advances() {
+        let mut mmu = Mmu::new(256);
+        let mut test_image = vec![0u8; 512];
+        for i in 0..512 {
+            test_image[i] = (i % 256) as u8;
+        }
+        mmu.mmc_card_data = Some(test_image);
+        mmu.write_u32(0x1C00_0004, 0);
+        mmu.write_u32(0x1C00_0000, 17);
+        let w0 = mmu.read_u32(0x1C00_0010);
+        let w1 = mmu.read_u32(0x1C00_0010);
+        assert_eq!(w0 & 0xFF, 0);
+        assert_eq!(w1 & 0xFF, 4);
+        assert_eq!(mmu.mmc_buffer_offset.get(), 8);
+    }
+
+    #[test]
+    fn test_mmc_cmd18_auto_advance_and_stop() {
+        let mut mmu = Mmu::new(256);
+        let mut test_image = vec![0u8; 1024];
+        for i in 0..512 {
+            test_image[i] = 0x11;
+        }
+        for i in 512..1024 {
+            test_image[i] = 0x22;
+        }
+        mmu.mmc_card_data = Some(test_image);
+        mmu.write_u32(0x1C00_0004, 0);
+        mmu.write_u32(0x1C00_0000, 18); // CMD18
+        assert!(mmu.mmc_multi_active.get());
+        // Drain first sector (128 words)
+        for _ in 0..128 {
+            let _ = mmu.read_u32(0x1C00_0010);
+        }
+        assert_eq!(mmu.mmc_current_sector.get(), 1);
+        let next = mmu.read_u32(0x1C00_0010);
+        assert_eq!(next & 0xFF, 0x22);
+        mmu.write_u32(0x1C00_0000, 12); // CMD12 stop
+        assert!(!mmu.mmc_multi_active.get());
+        assert_eq!(mmu.mmc_resp, 0);
+    }
+
+    #[test]
+    fn test_goldfish_pipe_version_and_open() {
+        let mut mmu = Mmu::new(4096);
+        assert_eq!(mmu.read_u32(0x1D00_0020), 1); // VERSION
+
+        let name = b"pipe:qemud:boot-properties\0";
+        mmu.load_bytes(0x100, name);
+        mmu.write_u32(0x1D00_0010, 0x100); // ADDRESS
+        mmu.write_u32(0x1D00_000C, name.len() as u32); // SIZE
+        mmu.write_u32(0x1D00_0000, 1); // OPEN
+        assert_eq!(mmu.pipe_status, 0);
+        assert_eq!(mmu.pipe_channel, 1);
+        assert_eq!(mmu.pipe_channels[0], "pipe:qemud:boot-properties");
+
+        mmu.write_u32(0x1D00_0000, 3); // POLL
+        assert_eq!(mmu.pipe_status, 0);
+        assert!(mmu.pipe_wakes & 2 != 0); // OUT
+
+        mmu.write_u32(0x1D00_0000, 2); // CLOSE
+        assert_eq!(mmu.pipe_status, 0);
+        assert!(mmu.pipe_channels[0].is_empty());
+    }
+
+    #[test]
+    fn test_goldfish_pipe_write_read_roundtrip() {
+        let mut mmu = Mmu::new(4096);
+        let name = b"pipe:qemud:test\0";
+        mmu.load_bytes(0x200, name);
+        mmu.write_u32(0x1D00_0010, 0x200);
+        mmu.write_u32(0x1D00_000C, name.len() as u32);
+        mmu.write_u32(0x1D00_0000, 1); // OPEN
+
+        let payload = b"ping";
+        mmu.load_bytes(0x300, payload);
+        mmu.write_u32(0x1D00_0010, 0x300);
+        mmu.write_u32(0x1D00_000C, payload.len() as u32);
+        mmu.write_u32(0x1D00_0000, 4); // WRITE
+        assert_eq!(mmu.pipe_status, 0);
+        assert!(!mmu.pipe_rx.is_empty());
+
+        mmu.write_u32(0x1D00_0010, 0x400);
+        mmu.write_u32(0x1D00_000C, 8);
+        mmu.write_u32(0x1D00_0000, 5); // READ
+        assert_eq!(mmu.pipe_status, 0);
+        assert_eq!(mmu.read_u8(0x400), b'o');
+        assert_eq!(mmu.read_u8(0x401), b'k');
     }

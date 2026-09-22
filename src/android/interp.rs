@@ -199,10 +199,19 @@ impl Vm {
                     self.stack[frame_idx].pc += insn.size;
                 }
             }
-            opcodes::IF_EQ => {
+            opcodes::IF_EQ | opcodes::IF_NE | opcodes::IF_LT | opcodes::IF_GE | opcodes::IF_GT | opcodes::IF_LE => {
                 let a = self.reg(frame_idx, insn.a)?.as_int();
                 let b = self.reg(frame_idx, insn.b)?.as_int();
-                if a == b {
+                let take = match op {
+                    opcodes::IF_EQ => a == b,
+                    opcodes::IF_NE => a != b,
+                    opcodes::IF_LT => a < b,
+                    opcodes::IF_GE => a >= b,
+                    opcodes::IF_GT => a > b,
+                    opcodes::IF_LE => a <= b,
+                    _ => false,
+                };
+                if take {
                     let off = insn.c as i16 as i32;
                     self.stack[frame_idx].pc =
                         (pc_i32(self.stack[frame_idx].pc) + off) as usize;
@@ -210,16 +219,59 @@ impl Vm {
                     self.stack[frame_idx].pc += insn.size;
                 }
             }
-            opcodes::IF_NE => {
-                let a = self.reg(frame_idx, insn.a)?.as_int();
-                let b = self.reg(frame_idx, insn.b)?.as_int();
-                if a != b {
-                    let off = insn.c as i16 as i32;
-                    self.stack[frame_idx].pc =
-                        (pc_i32(self.stack[frame_idx].pc) + off) as usize;
-                } else {
-                    self.stack[frame_idx].pc += insn.size;
-                }
+            opcodes::CHECK_CAST => {
+                // Soft check: keep object as-is
+                self.stack[frame_idx].pc += insn.size;
+            }
+            opcodes::NEW_ARRAY => {
+                let len = self.reg(frame_idx, insn.b)?.as_int();
+                let arr = self.host.alloc_array(len);
+                self.set_reg(frame_idx, insn.a, arr)?;
+                self.stack[frame_idx].pc += insn.size;
+            }
+            opcodes::ARRAY_LENGTH => {
+                let arr = self.reg(frame_idx, insn.b)?;
+                let len = self.host.array_len(arr).unwrap_or(0);
+                self.set_reg(frame_idx, insn.a, Value::Int(len))?;
+                self.stack[frame_idx].pc += insn.size;
+            }
+            opcodes::AGET => {
+                let arr = self.reg(frame_idx, insn.b)?;
+                let idx = self.reg(frame_idx, insn.c)?.as_int();
+                let v = self.host.array_get(arr, idx).unwrap_or(Value::Int(0));
+                self.set_reg(frame_idx, insn.a, v)?;
+                self.stack[frame_idx].pc += insn.size;
+            }
+            opcodes::APUT => {
+                let val = self.reg(frame_idx, insn.a)?;
+                let arr = self.reg(frame_idx, insn.b)?;
+                let idx = self.reg(frame_idx, insn.c)?.as_int();
+                let _ = self.host.array_set(arr, idx, val);
+                self.stack[frame_idx].pc += insn.size;
+            }
+            opcodes::ADD_INT | opcodes::SUB_INT | opcodes::MUL_INT => {
+                let lhs = self.reg(frame_idx, insn.b)?.as_int();
+                let rhs = self.reg(frame_idx, insn.c)?.as_int();
+                let v = match op {
+                    opcodes::ADD_INT => lhs.wrapping_add(rhs),
+                    opcodes::SUB_INT => lhs.wrapping_sub(rhs),
+                    opcodes::MUL_INT => lhs.wrapping_mul(rhs),
+                    _ => 0,
+                };
+                self.set_reg(frame_idx, insn.a, Value::Int(v))?;
+                self.stack[frame_idx].pc += insn.size;
+            }
+            opcodes::ADD_INT_2ADDR | opcodes::SUB_INT_2ADDR | opcodes::MUL_INT_2ADDR => {
+                let lhs = self.reg(frame_idx, insn.a)?.as_int();
+                let rhs = self.reg(frame_idx, insn.b)?.as_int();
+                let v = match op {
+                    opcodes::ADD_INT_2ADDR => lhs.wrapping_add(rhs),
+                    opcodes::SUB_INT_2ADDR => lhs.wrapping_sub(rhs),
+                    opcodes::MUL_INT_2ADDR => lhs.wrapping_mul(rhs),
+                    _ => 0,
+                };
+                self.set_reg(frame_idx, insn.a, Value::Int(v))?;
+                self.stack[frame_idx].pc += insn.size;
             }
             opcodes::IGET_OBJECT | opcodes::IPUT_OBJECT => {
                 // Minimal: treat as no-op store/load Int(0) for fixture apps.

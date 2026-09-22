@@ -129,5 +129,27 @@ mod tests {
         let err = AppRuntime::load(b"not an apk");
         assert!(err.is_err());
     }
-}
 
+    #[test]
+    fn dalvik_array_and_binop_helpers() {
+        use crate::android::decode;
+        use crate::android::hle::Value;
+        use crate::android::opcodes;
+
+        let insns = [
+            0x0312u16, // const/4 v0, #3
+            0x0412,    // const/4 v1, #4
+            0x10b0,    // add-int/2addr v0, v1
+            0x000f,    // return v0
+        ];
+        assert_eq!(decode::decode(&insns, 0).unwrap().op, opcodes::CONST_4);
+        assert_eq!(decode::decode(&insns, 2).unwrap().op, opcodes::ADD_INT_2ADDR);
+        assert_eq!(decode::decode(&insns, 2).unwrap().size, 1);
+
+        let mut host = crate::android::hle::HleHost::default();
+        let arr = host.alloc_array(2);
+        assert_eq!(host.array_len(arr), Some(2));
+        assert!(host.array_set(arr, 1, Value::Int(9)));
+        assert_eq!(host.array_get(arr, 1), Some(Value::Int(9)));
+    }
+}

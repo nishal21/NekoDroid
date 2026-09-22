@@ -818,4 +818,21 @@ mod tests {
             assert_eq!(cpu.regs.read(1), 0x00E2);
         });
     }
+
+    /// Optional: place a real goldfish `zImage` at `test-images/zImage` (gitignored).
+    /// Skips cleanly when the file is absent so CI stays green without huge blobs.
+    #[test]
+    fn test_optional_goldfish_zimage_smoke() {
+        let path = std::path::Path::new("test-images/zImage");
+        if !path.exists() {
+            return;
+        }
+        let kernel = std::fs::read(path).expect("read zImage");
+        assert!(kernel.len() > 1024, "zImage too small");
+        ARM_CPU.with(|cell| {
+            *cell.borrow_mut() = Some(cpu::Cpu::new(64 * 1024 * 1024));
+        });
+        let initrd = std::fs::read("test-images/initrd.cpio.gz").unwrap_or_default();
+        assert!(boot_linux_kernel(&kernel, &initrd));
+    }
 }

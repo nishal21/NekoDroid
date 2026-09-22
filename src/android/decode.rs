@@ -98,17 +98,54 @@ pub fn decode(insns: &[u16], pc: usize) -> Option<Insn> {
             insn.b = *insns.get(pc + 1)? as u16 as i16 as i32 as u32;
             insn.size = 2;
         }
-        opcodes::IF_EQ | opcodes::IF_NE => {
+        opcodes::IF_EQ | opcodes::IF_NE | opcodes::IF_LT | opcodes::IF_GE | opcodes::IF_GT | opcodes::IF_LE => {
             insn.a = ((raw0 >> 8) & 0xf) as u32;
             insn.b = ((raw0 >> 12) & 0xf) as u32;
             insn.c = *insns.get(pc + 1)? as u16 as i16 as i32 as u32;
             insn.size = 2;
+        }
+        opcodes::CHECK_CAST => {
+            // 21c: AA|op BBBB
+            insn.a = ((raw0 >> 8) & 0xff) as u32;
+            insn.b = *insns.get(pc + 1)? as u32;
+            insn.size = 2;
+        }
+        opcodes::NEW_ARRAY => {
+            // 22c: B|A|op CCCC — vA = dest, vB = size, CCCC = type
+            insn.a = ((raw0 >> 8) & 0xf) as u32;
+            insn.b = ((raw0 >> 12) & 0xf) as u32;
+            insn.c = *insns.get(pc + 1)? as u32;
+            insn.size = 2;
+        }
+        opcodes::AGET | opcodes::APUT => {
+            // 23x: AA|op BBBB CCCC — vAA value, vBB array, vCC index
+            insn.a = ((raw0 >> 8) & 0xff) as u32;
+            insn.b = *insns.get(pc + 1)? as u32;
+            insn.c = *insns.get(pc + 2)? as u32;
+            insn.size = 3;
+        }
+        opcodes::ARRAY_LENGTH => {
+            // 12x: B|A|op
+            insn.a = ((raw0 >> 8) & 0xf) as u32;
+            insn.b = ((raw0 >> 12) & 0xf) as u32;
         }
         opcodes::IGET_OBJECT | opcodes::IPUT_OBJECT => {
             insn.a = ((raw0 >> 8) & 0xf) as u32;
             insn.b = ((raw0 >> 12) & 0xf) as u32;
             insn.c = *insns.get(pc + 1)? as u32;
             insn.size = 2;
+        }
+        opcodes::ADD_INT | opcodes::SUB_INT | opcodes::MUL_INT => {
+            // 23x: AA|op BBBB CCCC
+            insn.a = ((raw0 >> 8) & 0xff) as u32;
+            insn.b = *insns.get(pc + 1)? as u32;
+            insn.c = *insns.get(pc + 2)? as u32;
+            insn.size = 3;
+        }
+        opcodes::ADD_INT_2ADDR | opcodes::SUB_INT_2ADDR | opcodes::MUL_INT_2ADDR => {
+            // 12x: B|A|op
+            insn.a = ((raw0 >> 8) & 0xf) as u32;
+            insn.b = ((raw0 >> 12) & 0xf) as u32;
         }
         opcodes::INVOKE_VIRTUAL
         | opcodes::INVOKE_SUPER
