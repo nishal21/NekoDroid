@@ -1278,8 +1278,15 @@ impl Cpu {
             }
             // 001 = Data Processing (immediate)
             0b001 => self.execute_data_processing(instr),
-            // 010 = Load/Store (immediate offset)
-            0b010 => self.execute_single_data_transfer(instr),
+            // 010 = Load/Store (immediate offset) OR ARMv7 barriers / CLREX (cond=1111)
+            0b010 => {
+                // CLREX / DMB / DSB / ISB live in the unconditional 0101_0111 space.
+                if (instr >> 28) == 0xF && ((instr >> 20) & 0xFF) == 0x57 {
+                    // Treat as NOP (no exclusive monitor / no caches to sync).
+                } else {
+                    self.execute_single_data_transfer(instr);
+                }
+            },
             // 011 = Load/Store (register offset) OR ARMv7 bit-field ops
             0b011 => {
                 // Media / bit4=1 space: extend, bitfield, else LDR/STR fallthrough.

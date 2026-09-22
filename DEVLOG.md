@@ -2107,3 +2107,23 @@ char* msg = "Application started";
 - Run past decompress into kernel early init / MMU / more console
 - Do not stage test-images / gunzip.bin / journals
 
+
+---
+
+## Session 62 — Past __error_p (Cortex-A9 MIDR)
+
+### Cause
+- After "done, booting", PC stuck at `b .` (`0x46cfcc`) = kernel `__error_p`
+- CP15 MIDR was ARM926 (`0x41069265`); goldfish zImage proc_info only lists Cortex-A5/A7/A9/A15
+- `__lookup_processor_type` failed → halt
+
+### Fix
+- MIDR → Cortex-A9 `0x410FC090` (matches proc_info mask `0xff0ffff0`)
+- Silence CP15 unimplemented `log()` under `cfg(test)` (wasm-bindgen panics on native)
+- CLREX/DMB/DSB/ISB (cond=0xF, op=0x57) treated as NOP
+- `test_optional_goldfish_post_decompress` asserts not stuck in `__error_p`
+
+### Result
+- Leaves stub error path; PC ~`0x152ec` in early kernel (still no "Linux version")
+- Next: early MMU / page tables / more UART after stext
+

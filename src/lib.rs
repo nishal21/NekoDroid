@@ -1099,5 +1099,69 @@ mod tests {
             "expected Uncompressing/done"
         );
     }
+
+    /// Session 62: Cortex-A9 MIDR must pass __lookup_processor_type (leave __error_p).
+    #[test]
+    fn test_optional_goldfish_post_decompress() {
+        let path = std::path::Path::new("test-images/zImage");
+        if !path.exists() {
+            return;
+        }
+        let kernel = std::fs::read(path).expect("read zImage");
+        ARM_CPU.with(|cell| {
+            *cell.borrow_mut() = Some(cpu::Cpu::new(256 * 1024 * 1024));
+        });
+        assert!(boot_linux_kernel(&kernel, &[]));
+
+        let mut done_batch = None;
+        for batch in 0..400u32 {
+            let _ = run_batch(500_000, 50_000);
+            let (lines, partial, pc, r9) = ARM_CPU.with(|cell| {
+                let b = cell.borrow();
+                let c = b.as_ref().unwrap();
+                (
+                    c.mmu.uart_lines.clone(),
+                    c.mmu.uart_buffer().to_string(),
+                    c.regs.pc(),
+                    c.regs.read(9),
+                )
+            });
+
+            let done = lines.iter().any(|l| l.contains("done") || l.contains("Booting"))
+                || partial.contains("done");
+            if done && done_batch.is_none() {
+                done_batch = Some(batch);
+                eprintln!("at done: pc={pc:#x} r9={r9:#x} (MIDR) uart={lines:?}");
+            }
+
+            if let Some(db) = done_batch {
+                let halt = ARM_CPU.with(|cell| {
+                    let c = cell.borrow();
+                    let c = c.as_ref().unwrap();
+                    let w = c.mmu.read_u32(pc & !3);
+                    w == 0xeafffffd || w == 0xeafffffe
+                });
+                assert!(
+                    !halt,
+                    "__error_p halt at {pc:#x} r9={r9:#x} — CPU ID not in proc_info"
+                );
+
+                if lines.iter().any(|l| l.contains("Linux version"))
+                    || partial.contains("Linux version")
+                {
+                    eprintln!("early kernel uart batch={batch}: {lines:?} partial={partial:?}");
+                    return;
+                }
+
+                // After a few post-done batches, accept PC in low kernel space
+                // (not stuck at stub __error_p ~0x46cfc8).
+                if batch >= db + 20 && pc < 0x40_0000 {
+                    eprintln!("past __error_p: pc={pc:#x} r9={r9:#x}");
+                    return;
+                }
+            }
+        }
+        assert!(done_batch.is_some(), "expected done, booting");
+    }
 }
 

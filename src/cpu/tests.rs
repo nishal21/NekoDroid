@@ -1522,6 +1522,21 @@
     }
 
     #[test]
+    fn test_clrex_is_nop() {
+        // CLREX → F57FF01F (unconditional barrier space; must not LDR into PC)
+        let program: Vec<u8> = [
+            0xF57FF01Fu32.to_le_bytes(),
+            0xE3A00001u32.to_le_bytes(), // MOV R0, #1
+        ]
+        .concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        assert_eq!(cpu.regs.pc(), 4, "CLREX should fall through");
+        cpu.step();
+        assert_eq!(cpu.regs.read(0), 1);
+    }
+
+    #[test]
     fn test_cp15_mrc_mcr() {
         // MRC p15,0,R0,c0,c0,0  -> 0xEE100A10 (read MIDR)
         // MOV R1,#1             -> 0xE3A01001
@@ -1536,7 +1551,7 @@
         let mut cpu = cpu_with_program(&program);
 
         cpu.step();
-        assert_eq!(cpu.regs.read(0), 0x4106_9265);
+        assert_eq!(cpu.regs.read(0), 0x410F_C090);
 
         cpu.step();
         assert_eq!(cpu.regs.read(1), 0x1);

@@ -11,8 +11,9 @@ pub struct Cp15 {
 impl Cp15 {
     pub fn new() -> Self {
         Self {
-            // ARM926EJ-S MIDR base value (variant/revision-neutral for procinfo matching)
-            c0_midr: 0x4106_9265,
+            // Cortex-A9 MIDR — goldfish zImage proc_info matches 0x410fc090 / mask 0xff0ffff0.
+            // ARM926 (0x41069265) fails __lookup_processor_type → __error_p halt.
+            c0_midr: 0x410F_C090,
             // ARM926 reset-style control register value used by Linux early boot checks.
             c1_sctlr: 0x0000_0C12,
             c2_ttbr0: 0,
@@ -33,10 +34,13 @@ impl Cp15 {
             // CP15 c7/c8 maintenance/status reads are modeled as benign zero.
             (7, _, _, _) | (8, _, _, _) => 0,
             _ => {
-                crate::log(&format!(
-                    "⚠️ Unimplemented CP15 read: CRn={}, CRm={}, opc1={}, opc2={}",
-                    crn, crm, opc1, opc2
-                ));
+                #[cfg(not(test))]
+                {
+                    crate::log(&format!(
+                        "⚠️ Unimplemented CP15 read: CRn={}, CRm={}, opc1={}, opc2={}",
+                        crn, crm, opc1, opc2
+                    ));
+                }
                 0
             }
         }
@@ -52,10 +56,15 @@ impl Cp15 {
             // CP15 c7/c8 maintenance operations (cache/TLB/BTB) are no-ops in this model.
             // Linux uses these during MMU enable/transition; treat them as supported.
             (7, _, _, _) | (8, _, _, _) => {}
-            _ => crate::log(&format!(
-                "⚠️ Unimplemented CP15 write: CRn={}, CRm={}, opc1={}, opc2={}, val={:#010X}",
-                crn, crm, opc1, opc2, val
-            )),
+            _ => {
+                #[cfg(not(test))]
+                {
+                    crate::log(&format!(
+                        "⚠️ Unimplemented CP15 write: CRn={}, CRm={}, opc1={}, opc2={}, val={:#010X}",
+                        crn, crm, opc1, opc2, val
+                    ));
+                }
+            }
         }
     }
 }
