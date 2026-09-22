@@ -1544,7 +1544,7 @@
         assert_eq!(cpu.mmu.read_u32(0x100), 2);
         assert_eq!(cpu.mmu.read_u32(0x10C), 0x5441_0002);
         assert_eq!(cpu.mmu.read_u32(0x110), 16 * 1024 * 1024);
-        assert_eq!(cpu.mmu.read_u32(0x118), 17); // ATAG_CMDLINE size words
+        assert_eq!(cpu.mmu.read_u32(0x118), 20); // ATAG_CMDLINE size words
         assert_eq!(cpu.mmu.read_u32(0x11C), 0x5441_0009); // ATAG_CMDLINE tag
     }
 
@@ -1561,7 +1561,7 @@
         assert_eq!(cpu.mmu.read_u32(0x120), 0x0080_0000); // initrd base
         assert_eq!(cpu.mmu.read_u32(0x124), 4); // initrd size
         assert_eq!(cpu.mmu.read_u32(0x0080_0000), 0x4433_2211); // initrd copied to RAM
-        assert_eq!(cpu.mmu.read_u32(0x128), 17); // ATAG_CMDLINE follows INITRD2
+        assert_eq!(cpu.mmu.read_u32(0x128), 20); // ATAG_CMDLINE follows INITRD2
         assert_eq!(cpu.mmu.read_u32(0x12C), 0x5441_0009);
     }
 

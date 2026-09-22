@@ -2002,3 +2002,18 @@ char* msg = "Application started";
 - Optional initrd/system.img under test-images/
 - More Binder command decoding as guests need it
 
+---
+
+## Session 57 — Goldfish TTY + goldfish boot params
+
+### Done
+- Goldfish TTY MMIO at `0xFF002000` (PUT_CHAR + WRITE_BUFFER) → `uart_lines`
+- `boot_linux_kernel` machine id `0x046F`, cmdline `console=ttyS0 earlyprintk …`
+- Unit test for TTY put_char/buffer; 128 lib tests green
+- Long step probe: after ~2M insn PC hits `0x10` (data-abort vector); no UART yet
+
+### Next
+- Debug data-abort during zImage decompress (why PC→0x10)
+- Then earlyprintk lines should show on Goldfish TTY
+- Optional initrd once decompress survives
+

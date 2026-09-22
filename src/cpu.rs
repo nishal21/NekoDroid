@@ -480,7 +480,7 @@ impl Cpu {
         }
 
         // 4. ATAG_CMDLINE (Tell Linux to use our UART and load the RAM disk)
-        let cmdline = b"console=ttyAMA0 earlyprintk root=/dev/ram0 rdinit=/bin/sh\0";
+        let cmdline = b"console=ttyS0 earlyprintk keep_bootcon root=/dev/ram0 rdinit=/bin/sh\0";
         let cmdline_words = (cmdline.len() as u32 + 3) / 4;
         self.mmu.write_u32(atag_base + offset, 2 + cmdline_words); // size
         self.mmu.write_u32(atag_base + offset + 4, 0x5441_0009); // ATAG_CMDLINE tag

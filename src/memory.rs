@@ -55,6 +55,18 @@ const GOLDFISH_FB_SIZE: u32 = 0x0100_0000; // 16MB for high-res framebuffer
 const GOLDFISH_PIPE_BASE: u32 = 0x1D00_0000;
 const GOLDFISH_PIPE_SIZE: u32 = 0x0010_0000;
 
+// Classic Goldfish TTY (earlyprintk / console) — outside low RAM, must be MMIO
+const GOLDFISH_TTY_BASE: u32 = 0xFF00_2000;
+const GOLDFISH_TTY_SIZE: u32 = 0x1000;
+const GOLDFISH_TTY_PUT_CHAR: u32 = 0x00;
+const GOLDFISH_TTY_BYTES_READY: u32 = 0x04;
+const GOLDFISH_TTY_CMD: u32 = 0x08;
+const GOLDFISH_TTY_DATA_PTR: u32 = 0x10;
+const GOLDFISH_TTY_DATA_LEN: u32 = 0x14;
+const GOLDFISH_TTY_VERSION: u32 = 0x20;
+const GOLDFISH_TTY_CMD_WRITE_BUFFER: u32 = 2;
+const GOLDFISH_TTY_CMD_READ_BUFFER: u32 = 3;
+
 // Android Binder IPC driver MMIO region
 const BINDER_BASE: u32 = 0x0A00_0000; // Moved to avoid VRAM conflict
 const BINDER_SIZE: u32 = 0x0010_0000;
@@ -232,6 +244,10 @@ pub struct Mmu {
     pub binder_last_cmd: u32,
     /// Number of BC_* command words consumed from write buffers
     pub binder_tx_count: u32,
+
+    // ── Goldfish TTY ─────────────────────────────────────────────────
+    pub goldfish_tty_data_ptr: u32,
+    pub goldfish_tty_data_len: u32,
     
     // ── SD/MMC Card Interface ──────────────────────────────────────────
     /// MMC command register
@@ -374,6 +390,8 @@ impl Mmu {
             binder_status: 0,
             binder_last_cmd: 0,
             binder_tx_count: 0,
+            goldfish_tty_data_ptr: 0,
+            goldfish_tty_data_len: 0,
             // SD/MMC fields
             mmc_cmd: 0,
             mmc_arg: 0,
@@ -451,6 +469,8 @@ impl Mmu {
         (addr >= GOLDFISH_FB_BASE && addr < GOLDFISH_FB_BASE + GOLDFISH_FB_SIZE) ||
         // Goldfish Pipe
         (addr >= GOLDFISH_PIPE_BASE && addr < GOLDFISH_PIPE_BASE + GOLDFISH_PIPE_SIZE) ||
+        // Goldfish classic TTY
+        (addr >= GOLDFISH_TTY_BASE && addr < GOLDFISH_TTY_BASE + GOLDFISH_TTY_SIZE) ||
         // Binder IPC
         (addr >= BINDER_BASE && addr < BINDER_BASE + BINDER_SIZE) ||
         // SD/MMC card
@@ -662,6 +682,23 @@ impl Mmu {
         }
         self.binder_read_size = woff as u32;
         self.binder_status = 0;
+    }
+
+    fn execute_goldfish_tty_cmd(&mut self, cmd: u32) {
+        match cmd {
+            GOLDFISH_TTY_CMD_WRITE_BUFFER => {
+                let len = self.goldfish_tty_data_len.min(4096) as usize;
+                let base = self.goldfish_tty_data_ptr;
+                for i in 0..len {
+                    let b = self.read_u8(base.wrapping_add(i as u32));
+                    self.uart_write_byte(b);
+                }
+            }
+            GOLDFISH_TTY_CMD_READ_BUFFER => {
+                // No host→guest input yet
+            }
+            _ => {}
+        }
     }
 
     fn execute_pipe_command(&mut self) {
@@ -950,6 +987,16 @@ impl Mmu {
                     _ => 0,
                 };
             }
+            // Goldfish classic TTY (earlyprintk)
+            if addr >= GOLDFISH_TTY_BASE && addr < GOLDFISH_TTY_BASE + GOLDFISH_TTY_SIZE {
+                return match addr - GOLDFISH_TTY_BASE {
+                    GOLDFISH_TTY_BYTES_READY => 0,
+                    GOLDFISH_TTY_VERSION => 0, // classic goldfish uses VA buffers
+                    GOLDFISH_TTY_DATA_PTR => self.goldfish_tty_data_ptr,
+                    GOLDFISH_TTY_DATA_LEN => self.goldfish_tty_data_len,
+                    _ => 0,
+                };
+            }
             // Binder IPC — version + write_read stub
             if addr >= BINDER_BASE && addr < BINDER_BASE + 0x100 {
                 return match addr - BINDER_BASE {
@@ -1066,6 +1113,11 @@ impl Mmu {
         // Versatile PB PL011 UART0 DR write (used by Linux early printk)
         if addr == VPB_UART0_BASE {
             self.vpb_uart_write_byte(val);
+            return;
+        }
+        // Goldfish TTY PUT_CHAR (byte path)
+        if addr == GOLDFISH_TTY_BASE + GOLDFISH_TTY_PUT_CHAR {
+            self.uart_write_byte(val);
             return;
         }
 
@@ -1204,6 +1256,18 @@ impl Mmu {
                         }
                         MMC_REG_ARG => self.mmc_arg = val,
                         MMC_REG_CTRL => { /* Control register - no operation */ }
+                        _ => {}
+                    }
+                    return;
+                }
+                // Goldfish classic TTY
+                if addr >= GOLDFISH_TTY_BASE && addr < GOLDFISH_TTY_BASE + GOLDFISH_TTY_SIZE {
+                    let off = addr - GOLDFISH_TTY_BASE;
+                    match off {
+                        GOLDFISH_TTY_PUT_CHAR => self.uart_write_byte((val & 0xFF) as u8),
+                        GOLDFISH_TTY_DATA_PTR => self.goldfish_tty_data_ptr = val,
+                        GOLDFISH_TTY_DATA_LEN => self.goldfish_tty_data_len = val,
+                        GOLDFISH_TTY_CMD => self.execute_goldfish_tty_cmd(val),
                         _ => {}
                     }
                     return;

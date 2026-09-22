@@ -45,3 +45,17 @@ cargo test test_optional_goldfish_zimage_smoke -- --nocapture
 3. Or use the UI kernel/initrd file pickers in the browser build
 
 Without `test-images/zImage`, the optional test **skips** (still passes).
+
+## Goldfish TTY
+
+Classic serial is at `0xFF002000`:
+
+| Offset | Name | Notes |
+|--------|------|--------|
+| 0x00 | PUT_CHAR | earlyprintk byte out |
+| 0x08 | CMD | 2 = WRITE_BUFFER |
+| 0x10 / 0x14 | DATA_PTR / DATA_LEN | buffer write |
+
+`boot_linux_kernel` uses goldfish machine id `0x046F` and cmdline `console=ttyS0 earlyprintk …`.
+
+Kernel decompress can take millions of instructions before the first UART byte; the step smoke checks PC progress and reports UART if/when it appears.

@@ -656,6 +656,21 @@
     }
 
     #[test]
+    fn test_goldfish_tty_put_char_and_buffer() {
+        let mut mmu = Mmu::new(4096);
+        mmu.write_u32(0xFF00_2000, b'H' as u32);
+        mmu.write_u32(0xFF00_2000, b'i' as u32);
+        mmu.write_u32(0xFF00_2000, b'\n' as u32);
+        assert_eq!(mmu.uart_lines, vec!["Hi".to_string()]);
+
+        mmu.load_bytes(0x300, b"OK\n");
+        mmu.write_u32(0xFF00_2010, 0x300); // DATA_PTR
+        mmu.write_u32(0xFF00_2014, 3); // DATA_LEN
+        mmu.write_u32(0xFF00_2008, 2); // CMD_WRITE_BUFFER
+        assert_eq!(mmu.uart_lines.last().map(|s| s.as_str()), Some("OK"));
+    }
+
+    #[test]
     fn test_goldfish_pipe_version_and_open() {
         let mut mmu = Mmu::new(4096);
         assert_eq!(mmu.read_u32(0x1D00_0020), 1); // VERSION

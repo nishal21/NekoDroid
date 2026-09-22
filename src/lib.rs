@@ -476,7 +476,7 @@ pub fn boot_linux_kernel(kernel_bytes: &[u8], initrd_bytes: &[u8]) -> bool {
         let mut borrow = cell.borrow_mut();
         if let Some(cpu) = borrow.as_mut() {
             let initrd = if initrd_bytes.is_empty() { None } else { Some(initrd_bytes) };
-            cpu.boot_linux(kernel_bytes, initrd, 0x00E2);
+            cpu.boot_linux(kernel_bytes, initrd, 0x046F); // MACH_TYPE_GOLDFISH
             CYCLE_COUNT.store(0, Ordering::Relaxed);
             true
         } else {
@@ -804,7 +804,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_boot_linux_kernel_wrapper_uses_machine_id_00e2() {
+    fn test_boot_linux_kernel_wrapper_uses_goldfish_machine_id() {
         ARM_CPU.with(|cell| {
             *cell.borrow_mut() = Some(cpu::Cpu::new(16 * 1024 * 1024));
         });
@@ -815,7 +815,7 @@ mod tests {
         ARM_CPU.with(|cell| {
             let borrow = cell.borrow();
             let cpu = borrow.as_ref().expect("CPU should be initialized");
-            assert_eq!(cpu.regs.read(1), 0x00E2);
+            assert_eq!(cpu.regs.read(1), 0x046F); // goldfish
         });
     }
 
@@ -875,9 +875,30 @@ mod tests {
         );
 
         eprintln!(
-            "goldfish step smoke: executed={executed} pc={pc_before:#x}->{pc_after:#x} uart_lines={} partial={:?}",
+            "goldfish step smoke: executed={executed} pc={pc_before:#x}->{pc_after:#x} uart_lines={} sample={:?}",
             uart_lines.len(),
-            uart_partial.chars().take(80).collect::<String>()
+            uart_lines.iter().take(3).cloned().collect::<Vec<_>>()
         );
+
+        // Decompression often needs millions of instructions before earlyprintk.
+        if uart_lines.is_empty() && uart_partial.is_empty() {
+            let more = run_batch(2_000_000, 50_000);
+            let (pc2, lines2, partial2) = ARM_CPU.with(|cell| {
+                let b = cell.borrow();
+                let c = b.as_ref().expect("cpu");
+                (
+                    c.regs.pc(),
+                    c.mmu.uart_lines.clone(),
+                    c.mmu.uart_buffer().to_string(),
+                )
+            });
+            eprintln!(
+                "goldfish uart long: more={more} pc={pc2:#x} lines={} partial={:?}",
+                lines2.len(),
+                partial2.chars().take(120).collect::<String>()
+            );
+            // Progress already asserted; UART may still be empty if decompress stalls.
+            let _ = lines2;
+        }
     }
 }
