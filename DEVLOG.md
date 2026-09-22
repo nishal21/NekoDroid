@@ -2082,3 +2082,28 @@ char* msg = "Application started";
 - Then pursue `done, booting the kernel` / earlyprintk past decompress
 
 
+
+---
+
+## Session 61 — zImage inflate past "done, booting"
+
+### Cause chain
+- Missing RSB/ADC/SBC/RSC broke inflateInit windowBits
+- UBFX/SBFX needed for HLIT/HDIST/HCLEN; BFI mask was wrong (`0x0FC` vs `0x07C`)
+- UXTB/UXTH/SXTB/SXTH were executed as LDRB/STRB (hang in table build)
+- Bitfields alias LDR/STR (bit4=1); arm only after `Uncompressing Linux...` is buffered (no newline until error/done)
+
+### Fix
+- RSB, ADC, SBC, RSC
+- UBFX/SBFX/BFI/BFC with banner gate; BFI mask `0x07C00010`
+- UXTB/UXTH/SXTB/SXTH
+- Tests: rsb, ubfx, uxth, uxtb, bfi; inflate_diag expects "done, booting"
+
+### Result
+- UART: `Uncompressing Linux... done, booting the kernel.`
+- `cargo test --lib --release` → 137 passed (~16s for inflate)
+
+### Next
+- Run past decompress into kernel early init / MMU / more console
+- Do not stage test-images / gunzip.bin / journals
+

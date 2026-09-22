@@ -189,6 +189,67 @@
     }
 
     #[test]
+    fn test_rsb_negates() {
+        // MOV R0, #-15 via MVN R0, #14 → E3E0000E
+        // RSBS R1, R0, #0 → E2701000  (R1 = 0 - R0 = 15, sets flags)
+        let program: Vec<u8> = [
+            0xE3E0000Eu32.to_le_bytes(),
+            0xE2701000u32.to_le_bytes(),
+        ]
+        .concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        assert_eq!(cpu.regs.read(0) as i32, -15);
+        cpu.step();
+        assert_eq!(cpu.regs.read(1), 15, "RSB #0 should negate");
+    }
+
+    #[test]
+    fn test_ubfx_extracts_field() {
+        // UBFX R1, R6, #10, #4 → E7E31556 (from goldfish zlib_inflate)
+        let program: Vec<u8> = [0xE7E31556u32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        // Bitfields arm after earlyprintk banner (see decode gate).
+        cpu.mmu.uart_lines.push("Uncompressing Linux...".into());
+        // hold-like value with HCLEN=13 at bits[13:10]
+        cpu.regs.write(6, (13u32 << 10) | (29 << 5) | 26);
+        cpu.step();
+        assert_eq!(cpu.regs.read(1), 13, "UBFX should extract HCLEN field");
+    }
+
+    #[test]
+    fn test_uxth_extracts_halfword() {
+        // UXTH R4, R4 → E6FF4074 (from goldfish inflate table build)
+        let program: Vec<u8> = [0xE6FF4074u32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.write(4, 0xABCD_1234);
+        cpu.step();
+        assert_eq!(cpu.regs.read(4), 0x1234, "UXTH should keep low halfword");
+    }
+
+    #[test]
+    fn test_uxtb_extracts_byte() {
+        // UXTB R0, R1 → E6EF0071
+        let program: Vec<u8> = [0xE6EF0071u32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.write(1, 0xFFFFFF80);
+        cpu.step();
+        assert_eq!(cpu.regs.read(0), 0x80, "UXTB should zero-extend low byte");
+    }
+
+    #[test]
+    fn test_bfi_inserts_field() {
+        // BFI R7, R10, #0, #8 → E7C7701A (msb=7, lsb=0) from goldfish inflate
+        let program: Vec<u8> = [0xE7C7701Au32.to_le_bytes()].concat();
+        let mut cpu = cpu_with_program(&program);
+        cpu.mmu.uart_lines.push("Uncompressing Linux...".into());
+        cpu.regs.write(7, 0xFFFF_FF00);
+        cpu.regs.write(10, 0x5A);
+        cpu.step();
+        assert_eq!(cpu.regs.read(7), 0xFFFF_FF5A, "BFI should insert low byte");
+    }
+
+    #[test]
     fn test_sub_instruction() {
         // MOV R0, #20  → E3A00014
         // SUB R1, R0, #5 → E2401005

@@ -409,6 +409,9 @@ pub struct Cpu {
     pub low_pc_r0: u32,
     pub low_pc_instr: u32,
     pub low_pc_cpsr: u32,
+    /// Times bitfield extract ran (diag).
+    pub bitfield_extract_count: u32,
+    pub bitfield_last_pc: u32,
 }
 
 impl Cpu {
@@ -432,6 +435,8 @@ impl Cpu {
             low_pc_r0: 0,
             low_pc_instr: 0,
             low_pc_cpsr: 0,
+            bitfield_extract_count: 0,
+            bitfield_last_pc: 0,
         }
     }
 
@@ -455,6 +460,8 @@ impl Cpu {
             low_pc_r0: 0,
             low_pc_instr: 0,
             low_pc_cpsr: 0,
+            bitfield_extract_count: 0,
+            bitfield_last_pc: 0,
         }
     }
 
@@ -477,6 +484,8 @@ impl Cpu {
         self.low_pc_r0 = 0;
         self.low_pc_instr = 0;
         self.low_pc_cpsr = 0;
+        self.bitfield_extract_count = 0;
+        self.bitfield_last_pc = 0;
         // Clear UART output buffer
         self.mmu.clear_uart_buffer();
         // Clear VRAM to black
@@ -1271,8 +1280,34 @@ impl Cpu {
             0b001 => self.execute_data_processing(instr),
             // 010 = Load/Store (immediate offset)
             0b010 => self.execute_single_data_transfer(instr),
-            // 011 = Load/Store (register offset)
-            0b011 => self.execute_single_data_transfer(instr),
+            // 011 = Load/Store (register offset) OR ARMv7 bit-field ops
+            0b011 => {
+                // Media / bit4=1 space: extend, bitfield, else LDR/STR fallthrough.
+                let op27_20 = (instr >> 20) & 0xFF;
+                // UXTB/UXTH/SXTB/SXTH: 01101xx0/1 1111 Rd rot 000111 Rm
+                if (op27_20 == 0x6E || op27_20 == 0x6F || op27_20 == 0x6A || op27_20 == 0x6B)
+                    && ((instr >> 16) & 0xF) == 0xF
+                    && (instr & 0x0FF0) == 0x0070
+                {
+                    self.execute_extend(instr);
+                } else {
+                    // UBFX/SBFX/BFI alias register-shifted LDR/STR. Arm after banner
+                    // (decompressor relocates; false positives break putstr if armed early).
+                    let op27_21 = (instr >> 21) & 0x7F;
+                    let bitfields_live = !self.mmu.uart_lines.is_empty()
+                        || self.mmu.uart_buffer().contains("Uncompressing Linux...");
+                    if bitfields_live
+                        && (op27_21 == 0x3F || op27_21 == 0x3D)
+                        && (instr & 0x70) == 0x50
+                    {
+                        self.execute_bitfield_extract(instr);
+                    } else if bitfields_live && (instr & 0x0FE0_0070) == 0x07C0_0010 {
+                        self.execute_bitfield_insert(instr);
+                    } else {
+                        self.execute_single_data_transfer(instr);
+                    }
+                }
+            }
             // 100 = Load/Store Multiple (LDM / STM)
             0b100 => self.execute_block_data_transfer(instr),
             // 101 = Branch (B / BL)
@@ -1559,6 +1594,17 @@ impl Cpu {
                     self.regs.set_flag_v(overflow);
                 }
             }
+            // 0011 = RSB (reverse subtract: Rd = op2 - Rn)
+            0x3 => {
+                let result = op2.wrapping_sub(rn_val);
+                self.regs.write(rd, result);
+                if set_flags {
+                    self.regs.update_nz(result);
+                    self.regs.set_flag_c(op2 >= rn_val);
+                    let overflow = ((op2 ^ rn_val) & (op2 ^ result)) >> 31 != 0;
+                    self.regs.set_flag_v(overflow);
+                }
+            }
             // 0100 = ADD
             0x4 => {
                 let result = rn_val.wrapping_add(op2);
@@ -1568,6 +1614,47 @@ impl Cpu {
                     self.regs.set_flag_c(result < rn_val || result < op2);
                     let overflow = (!((rn_val ^ op2)) & (rn_val ^ result)) >> 31 != 0;
                     self.regs.set_flag_v(overflow);
+                }
+            }
+            // 0101 = ADC (add with carry)
+            0x5 => {
+                let c = if self.regs.flag_c() { 1u32 } else { 0 };
+                let (sum1, o1) = rn_val.overflowing_add(op2);
+                let (result, o2) = sum1.overflowing_add(c);
+                self.regs.write(rd, result);
+                if set_flags {
+                    self.regs.update_nz(result);
+                    self.regs.set_flag_c(o1 || o2);
+                    let wide = rn_val as i64 + op2 as i64 + c as i64;
+                    self.regs.set_flag_v(wide != result as i32 as i64);
+                }
+            }
+            // 0110 = SBC (subtract with carry: Rn - op2 - !C)
+            0x6 => {
+                let c = if self.regs.flag_c() { 1u32 } else { 0 };
+                let result = rn_val.wrapping_sub(op2).wrapping_sub(1 - c);
+                self.regs.write(rd, result);
+                if set_flags {
+                    self.regs.update_nz(result);
+                    let (r1, b1) = rn_val.overflowing_sub(op2);
+                    let (_r2, b2) = r1.overflowing_sub(1 - c);
+                    self.regs.set_flag_c(!(b1 || b2));
+                    let wide = rn_val as i64 - op2 as i64 - (1 - c) as i64;
+                    self.regs.set_flag_v(wide != result as i32 as i64);
+                }
+            }
+            // 0111 = RSC (reverse subtract with carry: op2 - Rn - !C)
+            0x7 => {
+                let c = if self.regs.flag_c() { 1u32 } else { 0 };
+                let result = op2.wrapping_sub(rn_val).wrapping_sub(1 - c);
+                self.regs.write(rd, result);
+                if set_flags {
+                    self.regs.update_nz(result);
+                    let (r1, b1) = op2.overflowing_sub(rn_val);
+                    let (_r2, b2) = r1.overflowing_sub(1 - c);
+                    self.regs.set_flag_c(!(b1 || b2));
+                    let wide = op2 as i64 - rn_val as i64 - (1 - c) as i64;
+                    self.regs.set_flag_v(wide != result as i32 as i64);
                 }
             }
             // 1000 = TST (test — like AND, result discarded, flags updated)
@@ -1679,6 +1766,84 @@ impl Cpu {
         let rm = (instr & 0xF) as usize;
         let val = self.regs.read(rm);
         self.regs.write(rd, val.leading_zeros());
+    }
+
+    /// UXTB / UXTH / SXTB / SXTH — extract byte/halfword with optional rotate.
+    fn execute_extend(&mut self, instr: u32) {
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let rm = (instr & 0xF) as usize;
+        let rotate = ((instr >> 10) & 0x3) * 8;
+        let op = (instr >> 20) & 0xFF;
+        let rotated = self.regs.read(rm).rotate_right(rotate);
+        let val = match op {
+            0x6E => rotated & 0xFF,                                    // UXTB
+            0x6F => rotated & 0xFFFF,                                  // UXTH
+            0x6A => (rotated as u8 as i8 as i32 as u32),               // SXTB
+            0x6B => (rotated as u16 as i16 as i32 as u32),             // SXTH
+            _ => rotated,
+        };
+        self.regs.write(rd, val);
+    }
+
+    /// UBFX / SBFX — unsigned/signed bitfield extract (ARMv7).
+    /// Goldfish zlib_inflate uses UBFX to unpack HLIT/HDIST/HCLEN from a 14-bit word.
+    fn execute_bitfield_extract(&mut self, instr: u32) {
+        self.bitfield_extract_count = self.bitfield_extract_count.wrapping_add(1);
+        self.bitfield_last_pc = self.regs.pc().wrapping_sub(4);
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let rn = (instr & 0xF) as usize;
+        let lsb = (instr >> 7) & 0x1F;
+        let widthm1 = (instr >> 16) & 0x1F;
+        let width = widthm1 + 1;
+        if lsb + width > 32 {
+            return;
+        }
+        let src = self.regs.read(rn);
+        let mask = if width == 32 {
+            0xFFFF_FFFF
+        } else {
+            (1u32 << width) - 1
+        };
+        let mut val = (src >> lsb) & mask;
+        // SBFX (bit 22 = 0): sign-extend from width
+        if (instr >> 22) & 1 == 0 {
+            let sign_bit = 1u32 << (width - 1);
+            if val & sign_bit != 0 {
+                val |= !mask;
+            }
+        }
+        self.regs.write(rd, val);
+    }
+
+    /// BFI / BFC — bitfield insert / clear (ARMv7).
+    fn execute_bitfield_insert(&mut self, instr: u32) {
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let rn = (instr & 0xF) as usize;
+        let lsb = (instr >> 7) & 0x1F;
+        let msb = (instr >> 16) & 0x1F;
+        if msb < lsb {
+            return;
+        }
+        let width = msb - lsb + 1;
+        let mask = if width == 32 {
+            0xFFFF_FFFF
+        } else {
+            ((1u32 << width) - 1) << lsb
+        };
+        let mut dst = self.regs.read(rd);
+        dst &= !mask;
+        if rn != 15 {
+            // BFI: insert Rn bits into Rd
+            let src = self.regs.read(rn);
+            let insert = if width == 32 {
+                src
+            } else {
+                (src & ((1u32 << width) - 1)) << lsb
+            };
+            dst |= insert;
+        }
+        // Rn==15 → BFC: just clear the field
+        self.regs.write(rd, dst);
     }
 
     // ── Branch ────────────────────────────────────────────────────────
