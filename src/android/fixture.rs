@@ -83,6 +83,75 @@ pub fn build_hello_dex() -> Result<Vec<u8>> {
     Ok(b.finish())
 }
 
+/// Build a DEX that computes 2+3 via add-int/2addr and prints `5` via HLE.
+pub fn build_arith_dex() -> Result<Vec<u8>> {
+    let mut b = DexBuilder::new();
+    let s_main = b.string("main");
+    let s_init = b.string("<init>");
+    let s_print_int = b.string("printInt");
+    let s_shorty_v = b.string("V");
+    let s_shorty_i = b.string("VI");
+    let s_shorty_va = b.string("V[L");
+
+    let t_arith = b.type_of("Lcom/nekodroid/Arith;");
+    let t_object = b.type_of("Ljava/lang/Object;");
+    let t_hle = b.type_of("Lnekodroid/Hle;");
+    let t_string_arr = b.type_of("[Ljava/lang/String;");
+    let t_void = b.type_of("V");
+    let t_int = b.type_of("I");
+
+    let p_void = b.proto(s_shorty_v, t_void, &[]);
+    let p_print_int = b.proto(s_shorty_i, t_void, &[t_int]);
+    let p_main = b.proto(s_shorty_va, t_void, &[t_string_arr]);
+
+    let m_print_int = b.method(t_hle, p_print_int, s_print_int);
+    let m_main = b.method(t_arith, p_main, s_main);
+    let m_init = b.method(t_arith, p_void, s_init);
+
+    // const/4 v0,#2; const/4 v1,#3; add-int/2addr v0,v1; invoke-static {v0}, printInt; return-void
+    let insns = vec![
+        0x2012, // const/4 v0, #2
+        0x3112, // const/4 v1, #3
+        0x10b0, // add-int/2addr v0, v1
+        0x1071, // invoke-static {v0}, printInt
+        m_print_int as u16,
+        0x0000,
+        0x000e, // return-void
+    ];
+
+    let code_main = CodeBlob {
+        registers_size: 2,
+        ins_size: 1,
+        outs_size: 1,
+        insns,
+    };
+    let code_init = CodeBlob {
+        registers_size: 1,
+        ins_size: 1,
+        outs_size: 0,
+        insns: vec![0x000e],
+    };
+
+    b.add_class(
+        t_arith,
+        t_object,
+        vec![
+            EncodedMeth {
+                method_idx: m_init,
+                access_flags: 0x10001,
+                code: Some(code_init),
+            },
+            EncodedMeth {
+                method_idx: m_main,
+                access_flags: 0x0009,
+                code: Some(code_main),
+            },
+        ],
+    );
+
+    Ok(b.finish())
+}
+
 pub fn build_hello_apk() -> Result<Vec<u8>> {
     let dex = build_hello_dex()?;
     let mut cursor = std::io::Cursor::new(Vec::new());

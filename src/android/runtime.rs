@@ -152,4 +152,22 @@ mod tests {
         assert!(host.array_set(arr, 1, Value::Int(9)));
         assert_eq!(host.array_get(arr, 1), Some(Value::Int(9)));
     }
+
+    #[test]
+    fn arith_dex_prints_five() {
+        use crate::android::dex::DexFile;
+        use crate::android::fixture;
+        use crate::android::hle::Value;
+        use crate::android::interp::Vm;
+
+        let bytes = fixture::build_arith_dex().expect("arith dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        let mut vm = Vm::new(dex);
+        vm.call_method("Lcom/nekodroid/Arith;", "main", &[Value::Obj(0)])
+            .expect("call");
+        let _ = vm.run_batch(1_000).expect("run");
+        assert!(vm.halted);
+        let logs = vm.host.logs.join("\n");
+        assert!(logs.contains('5'), "logs were: {logs}");
+    }
 }

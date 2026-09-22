@@ -7,6 +7,7 @@ NekoDroid's browser APK path is a constrained HLE Dalvik runner. It is not full 
 | APK | Notes |
 |-----|--------|
 | `testdata/hello.apk` | Single DEX, no native `.so`, prints via HLE Log / canvas text |
+| arith DEX (in-tree fixture) | `build_arith_dex`: 2+3 → `printInt` → logs `5` |
 
 ## Requirements for a fixture APK
 

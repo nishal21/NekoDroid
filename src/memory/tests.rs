@@ -409,8 +409,8 @@
     fn test_binder_version() {
         let mut mmu = Mmu::new(256);
 
-        // Binder protocol version should be 1 (at 0x0A00_0000)
-        assert_eq!(mmu.read_u32(0x0A00_0000), 0x00000001);
+        // Binder protocol version (simplified MMIO surface)
+        assert_eq!(mmu.read_u32(0x0A00_0000), 7);
     }
 
     #[test]
@@ -420,12 +420,28 @@
         // Initial sequence is 0
         assert_eq!(mmu.binder_seq, 0);
 
-        // Writing to Binder region increments sequence (at 0x0A00_0000)
-        mmu.write_u32(0x0A00_0004, 0);
+        // Unknown binder offset still bumps seq (legacy probe)
+        mmu.write_u32(0x0A00_0040, 0);
         assert_eq!(mmu.binder_seq, 1);
 
-        mmu.write_u32(0x0A00_0008, 0);
+        mmu.write_u32(0x0A00_0044, 0);
         assert_eq!(mmu.binder_seq, 2);
+    }
+
+    #[test]
+    fn test_binder_write_read_stub() {
+        let mut mmu = Mmu::new(4096);
+        mmu.write_u32(0x500, 0x1111_0001);
+        mmu.write_u32(0x504, 0x2222_0002);
+        mmu.write_u32(0x0A00_0004, 8); // write size
+        mmu.write_u32(0x0A00_0008, 0x500); // write buf
+        mmu.write_u32(0x0A00_000C, 16); // read capacity
+        mmu.write_u32(0x0A00_0010, 0x600); // read buf
+        mmu.write_u32(0x0A00_0014, 1); // DO_WRITE_READ
+        assert_eq!(mmu.binder_status, 0);
+        assert_eq!(mmu.binder_tx_count, 2);
+        assert_eq!(mmu.read_u32(0x600), 0x7201_0001);
+        assert_eq!(mmu.read_u32(0x604), 0x7201_000c);
     }
 
     #[test]

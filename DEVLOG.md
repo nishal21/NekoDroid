@@ -1986,3 +1986,19 @@ char* msg = "Application started";
 - More Binder/ASHMEM realism as goldfish boot needs it
 - Richer HLE fixtures beyond hello.apk
 
+---
+
+## Session 56 — Post-boot steps + Binder write_read + arith HLE
+
+### Done
+- UART line capture (`uart_lines`) for earlyprintk smoke
+- `test_optional_goldfish_zimage_steps`: 50k instructions after zImage load
+- Binder MMIO: version 7 + WRITE_READ stub (BR_OK/BR_NOOP)
+- `build_arith_dex` + `printInt` HLE (2+3 → logs `5`)
+- `cargo test --lib` → 127 passed
+
+### Next
+- Richer board model so kernel earlyprintk actually prints
+- Optional initrd/system.img under test-images/
+- More Binder command decoding as guests need it
+

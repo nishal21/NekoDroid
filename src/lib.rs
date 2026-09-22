@@ -835,4 +835,49 @@ mod tests {
         let initrd = std::fs::read("test-images/initrd.cpio.gz").unwrap_or_default();
         assert!(boot_linux_kernel(&kernel, &initrd));
     }
+
+    /// After loading zImage, execute a batch of instructions.
+    /// Asserts forward progress (PC moved or cycles ran). UART lines are optional —
+    /// earlyprintk may not light up without a fuller Versatile/goldfish board model.
+    #[test]
+    fn test_optional_goldfish_zimage_steps() {
+        let path = std::path::Path::new("test-images/zImage");
+        if !path.exists() {
+            return;
+        }
+        let kernel = std::fs::read(path).expect("read zImage");
+        ARM_CPU.with(|cell| {
+            *cell.borrow_mut() = Some(cpu::Cpu::new(64 * 1024 * 1024));
+        });
+        assert!(boot_linux_kernel(&kernel, &[]));
+
+        let pc_before = ARM_CPU.with(|cell| {
+            cell.borrow().as_ref().map(|c| c.regs.pc()).unwrap_or(0)
+        });
+
+        let executed = run_batch(50_000, 10_000);
+        assert!(executed > 0, "CPU executed no instructions after boot");
+
+        let (pc_after, uart_lines, uart_partial) = ARM_CPU.with(|cell| {
+            let b = cell.borrow();
+            let c = b.as_ref().expect("cpu");
+            (
+                c.regs.pc(),
+                c.mmu.uart_lines.clone(),
+                c.mmu.uart_buffer().to_string(),
+            )
+        });
+
+        // Progress: either PC changed or we drained a full batch (tight loop at same PC is rare)
+        assert!(
+            pc_after != pc_before || executed >= 1_000,
+            "no progress: pc {pc_before:#x}->{pc_after:#x}, executed={executed}"
+        );
+
+        eprintln!(
+            "goldfish step smoke: executed={executed} pc={pc_before:#x}->{pc_after:#x} uart_lines={} partial={:?}",
+            uart_lines.len(),
+            uart_partial.chars().take(80).collect::<String>()
+        );
+    }
 }

@@ -59,6 +59,23 @@ const GOLDFISH_PIPE_SIZE: u32 = 0x0010_0000;
 const BINDER_BASE: u32 = 0x0A00_0000; // Moved to avoid VRAM conflict
 const BINDER_SIZE: u32 = 0x0010_0000;
 
+// Simplified Binder MMIO (not full ioctl driver; enough for probe + write_read stub)
+const BINDER_REG_VERSION: u32 = 0x00;
+const BINDER_REG_WRITE_SIZE: u32 = 0x04;
+const BINDER_REG_WRITE_BUF: u32 = 0x08;
+const BINDER_REG_READ_SIZE: u32 = 0x0C;
+const BINDER_REG_READ_BUF: u32 = 0x10;
+const BINDER_REG_DO_WRITE_READ: u32 = 0x14;
+const BINDER_REG_STATUS: u32 = 0x18;
+const BINDER_REG_LAST_CMD: u32 = 0x1C;
+const BINDER_REG_TX_COUNT: u32 = 0x20;
+
+/// Protocol version reported to guests (matches common binder current version).
+const BINDER_PROTOCOL_VERSION: u32 = 7;
+/// BR_NOOP reply token written into the guest read buffer.
+const BINDER_BR_NOOP: u32 = 0x7201_000c; // loosely packed; guests that only poll status still work
+const BINDER_BR_OK: u32 = 0x7201_0001;
+
 // Goldfish RTC (Real-Time Clock for Android)
 const GOLDFISH_RTC_BASE: u32 = 0x1010_1000;
 
@@ -167,6 +184,8 @@ pub struct Mmu {
     vram: Vec<u8>,
     /// UART transmit buffer — accumulates characters until newline
     uart_tx_buffer: String,
+    /// Flushed UART lines (newline-terminated). Kept for kernel earlyprintk smoke.
+    pub uart_lines: Vec<String>,
     /// Currently pressed keycode (0 = no key)
     pub key_state: u32,
     /// Whether the screen is being touched/clicked
@@ -205,6 +224,14 @@ pub struct Mmu {
     pub goldfish_rtc: u64,
     /// Binder transaction sequence counter
     pub binder_seq: u32,
+    pub binder_write_size: u32,
+    pub binder_write_buf: u32,
+    pub binder_read_size: u32,
+    pub binder_read_buf: u32,
+    pub binder_status: u32,
+    pub binder_last_cmd: u32,
+    /// Number of BC_* command words consumed from write buffers
+    pub binder_tx_count: u32,
     
     // ── SD/MMC Card Interface ──────────────────────────────────────────
     /// MMC command register
@@ -320,6 +347,7 @@ impl Mmu {
             ram: vec![0u8; size],
             vram,
             uart_tx_buffer: String::new(),
+            uart_lines: Vec::new(),
             key_state: 0,
             touch_down: false,
             touch_x: 0,
@@ -339,6 +367,13 @@ impl Mmu {
             mmc_card_data: None,
             goldfish_rtc: 0,
             binder_seq: 0,
+            binder_write_size: 0,
+            binder_write_buf: 0,
+            binder_read_size: 0,
+            binder_read_buf: 0,
+            binder_status: 0,
+            binder_last_cmd: 0,
+            binder_tx_count: 0,
             // SD/MMC fields
             mmc_cmd: 0,
             mmc_arg: 0,
@@ -436,17 +471,14 @@ impl Mmu {
     fn uart_write_byte(&mut self, val: u8) {
         let ch = val as char;
         if ch == '\n' {
-            // Flush the buffer
+            let line = self.uart_tx_buffer.clone();
+            self.uart_lines.push(line.clone());
             #[cfg(not(test))]
             {
-                crate::log(&format!("📟 UART: {}", self.uart_tx_buffer));
-            }
-            #[cfg(test)]
-            {
-                // In tests, we just clear — tests check the buffer before flush
+                crate::log(&format!("📟 UART: {}", line));
             }
             self.uart_tx_buffer.clear();
-        } else {
+        } else if ch != '\r' {
             self.uart_tx_buffer.push(ch);
         }
     }
@@ -455,12 +487,14 @@ impl Mmu {
     fn vpb_uart_write_byte(&mut self, val: u8) {
         let ch = val as char;
         if ch == '\n' {
+            let line = self.uart_tx_buffer.clone();
+            self.uart_lines.push(line.clone());
             #[cfg(not(test))]
             {
-                crate::log(&format!("🐧 KERNEL: {}", self.uart_tx_buffer));
+                crate::log(&format!("🐧 KERNEL: {}", line));
             }
             self.uart_tx_buffer.clear();
-        } else {
+        } else if ch != '\r' {
             self.uart_tx_buffer.push(ch);
         }
     }
@@ -473,6 +507,7 @@ impl Mmu {
     /// Clears the UART TX buffer (used on CPU reset).
     pub fn clear_uart_buffer(&mut self) {
         self.uart_tx_buffer.clear();
+        self.uart_lines.clear();
     }
 
     /// Recomputes VIC output wire based on active+enabled interrupts.
@@ -594,6 +629,39 @@ impl Mmu {
             self.load_mmc_sector(next);
         }
         word
+    }
+
+    /// Consume guest binder write buffer commands and deposit BR_OK/BR_NOOP replies.
+    fn execute_binder_write_read(&mut self) {
+        let write_bytes = self.binder_write_size.min(4096) as usize;
+        let mut consumed = 0u32;
+        let mut off = 0usize;
+        while off + 4 <= write_bytes {
+            let cmd = self.read_u32(self.binder_write_buf.wrapping_add(off as u32));
+            self.binder_last_cmd = cmd;
+            consumed = consumed.wrapping_add(1);
+            off += 4;
+            // Skip a fixed payload window for transaction-like commands (best-effort).
+            if (cmd & 0xff) == 0 || write_bytes - off >= 64 {
+                // leave payload; real binder variable — we just count the header word
+            }
+        }
+        self.binder_tx_count = self.binder_tx_count.wrapping_add(consumed);
+        self.binder_seq = self.binder_seq.wrapping_add(1);
+
+        // Write BR_OK then BR_NOOP into the guest read buffer when space allows.
+        let read_cap = self.binder_read_size.min(4096) as usize;
+        let mut woff = 0usize;
+        if read_cap >= 4 {
+            self.write_u32(self.binder_read_buf.wrapping_add(woff as u32), BINDER_BR_OK);
+            woff += 4;
+        }
+        if read_cap >= 8 {
+            self.write_u32(self.binder_read_buf.wrapping_add(woff as u32), BINDER_BR_NOOP);
+            woff += 4;
+        }
+        self.binder_read_size = woff as u32;
+        self.binder_status = 0;
     }
 
     fn execute_pipe_command(&mut self) {
@@ -882,10 +950,17 @@ impl Mmu {
                     _ => 0,
                 };
             }
-            // Binder IPC - return protocol version/status
+            // Binder IPC — version + write_read stub
             if addr >= BINDER_BASE && addr < BINDER_BASE + 0x100 {
                 return match addr - BINDER_BASE {
-                    0x00 => 0x00000001, // BINDER_VERSION
+                    BINDER_REG_VERSION => BINDER_PROTOCOL_VERSION,
+                    BINDER_REG_WRITE_SIZE => self.binder_write_size,
+                    BINDER_REG_WRITE_BUF => self.binder_write_buf,
+                    BINDER_REG_READ_SIZE => self.binder_read_size,
+                    BINDER_REG_READ_BUF => self.binder_read_buf,
+                    BINDER_REG_STATUS => self.binder_status,
+                    BINDER_REG_LAST_CMD => self.binder_last_cmd,
+                    BINDER_REG_TX_COUNT => self.binder_tx_count,
                     _ => 0,
                 };
             }
@@ -1192,9 +1267,24 @@ impl Mmu {
                         _ => {}
                     }
                 }
-                // Binder IPC - increment transaction counter
+                // Binder IPC — configure write_read then DO_WRITE_READ
                 if addr >= BINDER_BASE && addr < BINDER_BASE + BINDER_SIZE {
-                    self.binder_seq = self.binder_seq.wrapping_add(1);
+                    let off = addr - BINDER_BASE;
+                    match off {
+                        BINDER_REG_WRITE_SIZE => self.binder_write_size = val,
+                        BINDER_REG_WRITE_BUF => self.binder_write_buf = val,
+                        BINDER_REG_READ_SIZE => self.binder_read_size = val,
+                        BINDER_REG_READ_BUF => self.binder_read_buf = val,
+                        BINDER_REG_DO_WRITE_READ => {
+                            if val != 0 {
+                                self.execute_binder_write_read();
+                            }
+                        }
+                        _ => {
+                            self.binder_seq = self.binder_seq.wrapping_add(1);
+                        }
+                    }
+                    return;
                 }
                 return;
             }

@@ -153,6 +153,13 @@ impl HleHost {
             return Some(Value::Int(0));
         }
 
+        // HLE integer print (for arith fixtures)
+        if class == "Lnekodroid/Hle;" && name == "printInt" {
+            let n = args.last().map(|v| v.as_int()).unwrap_or(0);
+            self.log_line(format!("{n}"));
+            return Some(Value::Int(0));
+        }
+
         // TextView.setText
         if name == "setText" && class.contains("TextView") {
             let msg = args
