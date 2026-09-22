@@ -13,11 +13,21 @@ import init, {
   load_custom_hex,
   load_rom,
   boot_linux_kernel,
+  get_cp15_midr,
   get_vram_ptr,
   get_vram_len,
   get_audio_ctrl,
   get_audio_freq,
+  load_apk,
+  launch_apk,
+  run_dalvik_batch,
+    get_dalvik_logs,
+  get_apk_info,
+  blit_dalvik_text_to_vram,
+  dalvik_touch,
 } from '../pkg/nekodroid.js';
+
+const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
 
 // ── Web Audio API state ────────────────────────────────────────────────
 let audioCtx: AudioContext | null = null;
@@ -25,6 +35,9 @@ let oscillator: OscillatorNode | null = null;
 let gainNode: GainNode | null = null;
 let isAudioInitialized = false;
 const WAVEFORMS: OscillatorType[] = ['square', 'sine', 'sawtooth', 'triangle'];
+
+let pendingKernel: Uint8Array | null = null;
+let pendingInitrd: Uint8Array = new Uint8Array(); // Empty by default
 
 // ── Types ──────────────────────────────────────────────────────────────
 type RenderMode = 'noise' | 'gradient' | 'plasma' | 'vram';
@@ -37,7 +50,7 @@ app.innerHTML = `
     <header class="header">
       <div class="logo-glow"></div>
       <h1>🐱 nekodroid</h1>
-      <p class="subtitle">Wasm CPU Emulator — Framebuffer Test</p>
+      <p class="subtitle">Wasm ARM emulator + constrained APK/DEX HLE</p>
     </header>
 
     <div class="status-panel">
@@ -141,11 +154,28 @@ app.innerHTML = `
         <button id="btn-upload-rom" class="debug-btn hex-upload-btn" style="background: linear-gradient(135deg, #4c1d95, #7c3aed); border-color: #a855f7;">
           <span class="btn-icon">💿</span> Select & Load .bin
         </button>
-        <div class="linux-upload-header" style="margin-top: 10px; font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); letter-spacing: 0.15em;">BOOT LINUX KERNEL (.zImage / Image)</div>
-        <input type="file" id="linux-file-input" accept=".zImage,.bin,Image" style="display: none;" />
-        <button id="btn-upload-linux" class="debug-btn hex-upload-btn" style="background: linear-gradient(135deg, #059669, #10b981); border-color: #34d399;">
-          <span class="btn-icon">🐧</span> Boot Linux zImage
-        </button>
+        <div class="linux-upload-section" style="margin-top: 15px; padding: 10px; border: 1px dashed var(--border-color);">
+          <div style="font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); margin-bottom: 5px;">LINUX KERNEL (.zImage)</div>
+          <input type="file" id="kernel-input" accept=".zImage,Image" />
+
+          <div style="font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); margin-top: 10px; margin-bottom: 5px;">INITRAMFS (.cpio.gz)</div>
+          <input type="file" id="initrd-input" accept=".cpio.gz,.cpio" />
+
+          <button id="btn-boot-linux" class="debug-btn hex-upload-btn" style="width: 100%; margin-top: 15px; background: linear-gradient(135deg, #059669, #10b981); border-color: #34d399;">
+            <span class="btn-icon">🐧</span> BOOT LINUX
+          </button>
+        </div>
+        <div class="apk-upload-section" style="margin-top: 15px; padding: 10px; border: 1px dashed var(--border-color);">
+          <div style="font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); margin-bottom: 5px;">APK (HLE DEX — not full Android)</div>
+          <input type="file" id="apk-file-input" accept=".apk" style="display: none;" />
+          <button id="btn-upload-apk" class="debug-btn hex-upload-btn" style="background: linear-gradient(135deg, #9a3412, #ea580c); border-color: #fb923c;">
+            <span class="btn-icon">📦</span> Load APK
+          </button>
+          <button id="btn-run-apk" class="debug-btn hex-upload-btn" style="margin-top: 8px; background: linear-gradient(135deg, #1e3a8a, #2563eb); border-color: #60a5fa;">
+            <span class="btn-icon">▶️</span> Run APK (HLE)
+          </button>
+          <pre id="apk-logcat" style="margin-top: 8px; max-height: 120px; overflow: auto; font-size: 0.65rem; white-space: pre-wrap;"></pre>
+        </div>
       </div>
     </div>
 
@@ -209,11 +239,19 @@ async function main() {
     let mode: RenderMode = 'noise';
     let paused = false;
     let running = false;  // Continuous CPU execution mode
-    const BATCH_SIZE = 200_000; // Instructions per frame (~10ms at 20M ips → 60 FPS)
+    const BATCH_SIZE = 1_000_000; // Higher throughput helps Linux decompression/boot progress
     let frameNumber = 0;
     let lastTime = performance.now();
     let fpsFrames = 0;
     let fpsAccum = 0;
+    let linuxBootWatchActive = false;
+    let linuxBootStartMs = 0;
+    let linuxLastProbeMs = 0;
+    let linuxLastHeartbeatLogMs = 0;
+    let linuxLastPc: number | null = null;
+    let linuxLastInstr = '';
+    let linuxSamePcCount = 0;
+    let linuxWarned15s = false;
 
     // ── Render loop ───────────────────────────────────────────────
     function renderFrame(now: number) {
@@ -252,9 +290,46 @@ async function main() {
         if (running) {
           const TIMER_INTERVAL = BATCH_SIZE; // 1 tick per frame → snake frame_skip=4 → 15 moves/sec
           const executed = run_batch(BATCH_SIZE, TIMER_INTERVAL);
+
+          if (linuxBootWatchActive && now - linuxLastProbeMs >= 1000) {
+            linuxLastProbeMs = now;
+            try {
+              const state = JSON.parse(get_cpu_state());
+              const pc = (state.regs?.[15] ?? 0) >>> 0;
+
+              if (linuxLastPc === pc) {
+                linuxSamePcCount++;
+              } else {
+                linuxSamePcCount = 0;
+              }
+              linuxLastPc = pc;
+
+              if (now - linuxLastHeartbeatLogMs >= 5000) {
+                linuxLastHeartbeatLogMs = now;
+                const instr = (state.disasm?.[0] ?? '').toString();
+                linuxLastInstr = instr;
+                const modeLabel = state.t ? 'Thumb' : 'ARM';
+                addLog(`🐧 Boot heartbeat: PC=0x${pc.toString(16).toUpperCase().padStart(8, '0')}, mode=${modeLabel}, cycles=${get_cycle_count()}, instr=${instr}`, 'info');
+              }
+
+              if (!linuxWarned15s && now - linuxBootStartMs >= 30000 && linuxSamePcCount >= 10) {
+                linuxWarned15s = true;
+                addLog('⚠️ No Linux output yet; boot is still executing. If this persists with a stable PC, it is likely an unimplemented path.', 'system');
+              }
+
+              if (linuxSamePcCount >= 10) {
+                addLog(`⚠️ Boot appears stalled at PC=0x${pc.toString(16).toUpperCase().padStart(8, '0')} (${linuxLastInstr})`, 'system');
+                linuxBootWatchActive = false;
+              }
+            } catch (_) {
+              // ignore transient parse errors
+            }
+          }
+
           if (executed < BATCH_SIZE) {
             // CPU halted before finishing the batch
             running = false;
+            linuxBootWatchActive = false;
             const btnRun = document.getElementById('btn-run')!;
             btnRun.querySelector('.btn-icon')!.textContent = '▶️';
             btnRun.childNodes[1].textContent = ' Run';
@@ -268,6 +343,7 @@ async function main() {
         // Process deferred touch release AFTER batch (ensures CPU sees touch for ≥1 full frame)
         if (pendingRelease) {
           send_touch_event(pendingRelease.x, pendingRelease.y, false);
+          dalvik_touch(pendingRelease.x, pendingRelease.y, false);
           addLog(`Touch UP at (${pendingRelease.x}, ${pendingRelease.y})`);
           pendingRelease = null;
         }
@@ -392,6 +468,7 @@ async function main() {
       isMouseDown = true;
       const [x, y] = canvasCoords(e);
       send_touch_event(x, y, true);
+      dalvik_touch(x, y, true);
       addLog(`Touch DOWN at (${x}, ${y})`);
     });
 
@@ -399,6 +476,7 @@ async function main() {
       if (!isMouseDown) return;
       const [x, y] = canvasCoords(e);
       send_touch_event(x, y, true);
+      dalvik_touch(x, y, true);
     });
 
     canvas.addEventListener('mouseup', (e) => {
@@ -574,6 +652,7 @@ async function main() {
         (btnRun as HTMLButtonElement).style.borderColor = '#ef4444';
         addLog(`CPU running (${BATCH_SIZE.toLocaleString()} instructions/frame)...`, 'success');
       } else {
+        linuxBootWatchActive = false;
         btnRun.querySelector('.btn-icon')!.textContent = '▶️';
         btnRun.childNodes[1].textContent = ' Run';
         (btnRun as HTMLButtonElement).style.background = 'linear-gradient(135deg, #065f46, #059669)';
@@ -631,32 +710,144 @@ async function main() {
       romFileInput.value = '';
     });
 
-    // ── Linux kernel upload ────────────────────────────────────────
-    const linuxFileInput = document.getElementById('linux-file-input') as HTMLInputElement;
-    document.getElementById('btn-upload-linux')!.addEventListener('click', () => {
-      linuxFileInput.click();
-    });
+    // ── Linux kernel + initramfs staging and boot ───────────────────
+    const kernelInput = document.getElementById('kernel-input') as HTMLInputElement;
+    const initrdInput = document.getElementById('initrd-input') as HTMLInputElement;
 
-    linuxFileInput.addEventListener('change', () => {
-      const file = linuxFileInput.files?.[0];
+    function readFileAsUint8Array(file: File): Promise<Uint8Array> {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsArrayBuffer(file);
+      });
+    }
+
+    kernelInput.addEventListener('change', () => {
+      const file = kernelInput.files?.[0];
       if (!file) return;
+
       const reader = new FileReader();
       reader.onload = () => {
         const buffer = reader.result as ArrayBuffer;
-        const bytes = new Uint8Array(buffer);
-        const ok = boot_linux_kernel(bytes);
-        if (ok) {
-          setMode('vram', btnVram);
-          updateDebugPanel();
-          addLog(`🐧 Linux kernel boot prepared: ${file.name} (${bytes.length} bytes)`, 'success');
-          addLog('ATAG boot state configured, jumping to kernel at 0x8000', 'info');
-          console.log(`🐧 Linux boot sequence ready: ${file.name}, ${bytes.length} bytes`);
-        } else {
-          addLog('Failed to boot Linux kernel — is the emulator initialized?', 'system');
-        }
+        pendingKernel = new Uint8Array(buffer);
+        addLog(`Kernel staged: ${file.name} (${pendingKernel.length} bytes)`, 'success');
       };
       reader.readAsArrayBuffer(file);
-      linuxFileInput.value = '';
+    });
+
+    initrdInput.addEventListener('change', () => {
+      const file = initrdInput.files?.[0];
+
+      if (!file) {
+        pendingInitrd = new Uint8Array();
+        addLog('Initramfs cleared (empty)', 'info');
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        const buffer = reader.result as ArrayBuffer;
+        pendingInitrd = new Uint8Array(buffer);
+        addLog(`Initramfs staged: ${file.name} (${pendingInitrd.length} bytes)`, 'success');
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+    document.getElementById('btn-boot-linux')!.addEventListener('click', async () => {
+      // Fallback: if staged state is empty but a file is selected, read it now.
+      if (!pendingKernel) {
+        const selectedKernel = kernelInput.files?.[0];
+        if (selectedKernel) {
+          pendingKernel = await readFileAsUint8Array(selectedKernel);
+          addLog(`Kernel staged: ${selectedKernel.name} (${pendingKernel.length} bytes)`, 'success');
+        }
+      }
+
+      if (pendingInitrd.length === 0) {
+        const selectedInitrd = initrdInput.files?.[0];
+        if (selectedInitrd) {
+          pendingInitrd = await readFileAsUint8Array(selectedInitrd);
+          addLog(`Initramfs staged: ${selectedInitrd.name} (${pendingInitrd.length} bytes)`, 'success');
+        }
+      }
+
+      if (!pendingKernel) {
+        alert('Please select a kernel first!');
+        return;
+      }
+
+      const ok = boot_linux_kernel(pendingKernel, pendingInitrd);
+      if (ok) {
+        setMode('vram', btnVram);
+        updateDebugPanel();
+        const midr = get_cp15_midr() >>> 0;
+        linuxBootWatchActive = true;
+        linuxBootStartMs = performance.now();
+        linuxLastProbeMs = 0;
+        linuxLastHeartbeatLogMs = 0;
+        linuxLastPc = null;
+        linuxLastInstr = '';
+        linuxSamePcCount = 0;
+        linuxWarned15s = false;
+        addLog(`🐧 Linux boot prepared (kernel: ${pendingKernel.length} bytes, initramfs: ${pendingInitrd.length} bytes)`, 'success');
+        addLog(`CP15 MIDR in runtime: 0x${midr.toString(16).toUpperCase().padStart(8, '0')}`, 'info');
+        if (pendingInitrd.length > 0 && pendingInitrd.length < 1024) {
+          addLog(`⚠️ Initramfs size (${pendingInitrd.length} bytes) looks unusually small; verify the selected .cpio/.cpio.gz file`, 'system');
+        }
+        addLog('ATAG boot state configured, jumping to kernel at 0x10000. Press Run to execute.', 'info');
+      } else {
+        addLog('Failed to boot Linux kernel — is the emulator initialized?', 'system');
+      }
+    });
+
+    const apkInput = document.getElementById('apk-file-input') as HTMLInputElement;
+    const apkLogcat = document.getElementById('apk-logcat')!;
+    document.getElementById('btn-upload-apk')!.addEventListener('click', () => apkInput.click());
+    apkInput.addEventListener('change', () => {
+      const file = apkInput.files?.[0];
+      if (!file) return;
+      if (file.size > MAX_UPLOAD_BYTES) {
+        addLog(`APK too large (${file.size} bytes). Limit is ${MAX_UPLOAD_BYTES}.`, 'system');
+        apkInput.value = '';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const bytes = new Uint8Array(reader.result as ArrayBuffer);
+          const ok = load_apk(bytes);
+          if (ok) {
+            addLog(`APK loaded: ${file.name} (${bytes.length} bytes)`, 'success');
+            addLog(get_apk_info(), 'info');
+          } else {
+            addLog('APK load failed (see console)', 'system');
+          }
+        } catch (e) {
+          addLog(`APK load error: ${e}`, 'system');
+        }
+        apkInput.value = '';
+      };
+      reader.onerror = () => addLog('Failed to read APK file', 'system');
+      reader.readAsArrayBuffer(file);
+    });
+
+    document.getElementById('btn-run-apk')!.addEventListener('click', () => {
+      try {
+        if (!launch_apk()) {
+          addLog('Launch failed — load an APK first', 'system');
+          return;
+        }
+        const steps = run_dalvik_batch(50_000);
+        blit_dalvik_text_to_vram();
+        setMode('vram', btnVram);
+        const logs = get_dalvik_logs();
+        apkLogcat.textContent = logs || '(no HLE logs)';
+        addLog(`HLE Dalvik ran ${steps} steps`, 'success');
+        if (logs) addLog(logs, 'info');
+      } catch (e) {
+        addLog(`APK run error: ${e}`, 'system');
+      }
     });
 
   } catch (err) {

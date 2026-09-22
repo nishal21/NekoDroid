@@ -14,6 +14,8 @@ const CPSR_C: u32 = 1 << 29; // Carry
 const CPSR_V: u32 = 1 << 28; // Overflow
 // Bit 7: IRQ disable
 const CPSR_I: u32 = 1 << 7;  // IRQ disabled
+// Bit 6: FIQ disable
+const CPSR_F: u32 = 1 << 6;  // FIQ disabled
 // Bit 5: Thumb state
 const CPSR_T: u32 = 1 << 5;  // Thumb mode (0 = ARM, 1 = Thumb)
 // Bits [4:0]: CPU mode
@@ -26,6 +28,7 @@ const MODE_IRQ: u32  = 0x12;
 const MODE_SVC: u32  = 0x13;  // Supervisor mode
 const MODE_ABT: u32  = 0x17;
 const MODE_UND: u32  = 0x1B;
+#[allow(dead_code)]
 const MODE_SYS: u32  = 0x1F;
 
 // Exception vector addresses
@@ -180,7 +183,14 @@ impl RegisterFile {
 
     /// Writes to a general-purpose register (0–15).
     pub fn write(&mut self, reg: usize, val: u32) {
-        self.regs[reg & 0xF] = val;
+        let r = reg & 0xF;
+        if r == REG_PC {
+            // Architectural alignment rules for PC writes.
+            // ARM state: word-aligned, Thumb state: halfword-aligned.
+            self.regs[REG_PC] = if self.is_thumb() { val & !1 } else { val & !3 };
+        } else {
+            self.regs[r] = val;
+        }
     }
 
     // ── Convenience accessors ─────────────────────────────────────────
@@ -384,6 +394,8 @@ pub struct Cpu {
     pub halted: bool,
     /// Set true when an exception is taken during an instruction.
     exception_raised: bool,
+    /// Optional HLE BIOS SWI-vector intercept for toy userspace demos.
+    hle_bios_enabled: bool,
 }
 
 impl Cpu {
@@ -395,6 +407,7 @@ impl Cpu {
             cp15: Cp15::new(),
             halted: false,
             exception_raised: false,
+            hle_bios_enabled: true,
         }
     }
 
@@ -406,6 +419,7 @@ impl Cpu {
             cp15: Cp15::new(),
             halted: false,
             exception_raised: false,
+            hle_bios_enabled: true,
         }
     }
 
@@ -416,6 +430,7 @@ impl Cpu {
         self.cp15 = Cp15::new();
         self.halted = false;
         self.exception_raised = false;
+        self.hle_bios_enabled = true;
         // Clear UART output buffer
         self.mmu.clear_uart_buffer();
         // Clear VRAM to black
@@ -427,8 +442,12 @@ impl Cpu {
     }
 
     /// Prepares the CPU to boot an ARM Linux kernel using the ATAGs protocol.
-    pub fn boot_linux(&mut self, kernel_bytes: &[u8], machine_type: u32) {
+    pub fn boot_linux(&mut self, kernel_bytes: &[u8], initrd_bytes: Option<&[u8]>, machine_type: u32) {
         self.reset();
+        self.hle_bios_enabled = false;
+
+        // QEMU-oriented ARM Linux image load/entry address.
+        let kernel_base = 0x0001_0000u32;
 
         let atag_base = 0x100u32;
         let mut offset = 0u32;
@@ -445,18 +464,55 @@ impl Cpu {
         self.mmu.write_u32(atag_base + offset + 12, 0x0000_0000);
         offset += 16;
 
-        // 3. ATAG_NONE
+        // 3. ATAG_INITRD2 (If an initramfs is provided)
+        if let Some(initrd) = initrd_bytes {
+            let initrd_base = 0x0080_0000; // Load it at 8MB into RAM
+            let initrd_size = initrd.len() as u32;
+
+            self.mmu.write_u32(atag_base + offset, 4); // size
+            self.mmu.write_u32(atag_base + offset + 4, 0x5442_0005); // ATAG_INITRD2 tag
+            self.mmu.write_u32(atag_base + offset + 8, initrd_base);
+            self.mmu.write_u32(atag_base + offset + 12, initrd_size);
+            offset += 16;
+
+            // Load the initramfs bytes into physical RAM
+            self.load_program(initrd_base, initrd);
+        }
+
+        // 4. ATAG_CMDLINE (Tell Linux to use our UART and load the RAM disk)
+        let cmdline = b"console=ttyAMA0 earlyprintk root=/dev/ram0 rdinit=/bin/sh\0";
+        let cmdline_words = (cmdline.len() as u32 + 3) / 4;
+        self.mmu.write_u32(atag_base + offset, 2 + cmdline_words); // size
+        self.mmu.write_u32(atag_base + offset + 4, 0x5441_0009); // ATAG_CMDLINE tag
+        offset += 8;
+
+        for chunk in cmdline.chunks(4) {
+            let mut word = 0u32;
+            for (i, &b) in chunk.iter().enumerate() {
+                word |= (b as u32) << (i * 8);
+            }
+            self.mmu.write_u32(atag_base + offset, word);
+            offset += 4;
+        }
+
+        // 5. ATAG_NONE
         self.mmu.write_u32(atag_base + offset, 0);
         self.mmu.write_u32(atag_base + offset + 4, 0x0000_0000);
 
-        // 4. Load kernel at 0x8000
-        self.load_program(0x8000, kernel_bytes);
+        // 6. Load kernel image
+        self.load_program(kernel_base, kernel_bytes);
 
-        // 5. Linux boot register contract
+        // 7. Linux boot register contract
         self.regs.write(0, 0);
         self.regs.write(1, machine_type);
         self.regs.write(2, atag_base);
-        self.regs.set_pc(0x8000);
+
+        // Enter kernel in privileged ARM state: SVC mode, IRQ/FIQ masked.
+        // Linux expects a supervisor-mode entry environment.
+        let boot_cpsr = (self.regs.cpsr() & !(CPSR_MODE_MASK | CPSR_T)) | MODE_SVC | CPSR_I | CPSR_F;
+        self.regs.set_cpsr(boot_cpsr);
+
+        self.regs.set_pc(kernel_base);
 
         #[cfg(not(test))]
         {
@@ -850,9 +906,41 @@ impl Cpu {
         }
     }
 
-    /// Disassembles the instruction at the given memory address.
-    pub fn disassemble_at(&self, addr: u32) -> String {
-        let instr = self.mmu.read_u32(addr);
+    fn translate_address_debug(&self, vaddr: u32) -> u32 {
+        if self.cp15.c1_sctlr & 1 == 0 {
+            return vaddr;
+        }
+
+        let table_base = self.cp15.c2_ttbr0 & 0xFFFF_C000;
+        let table_index = vaddr >> 20;
+        let desc_addr = table_base | (table_index << 2);
+        let descriptor = self.mmu.read_u32(desc_addr);
+
+        match descriptor & 0b11 {
+            0b10 => {
+                let phys_base = descriptor & 0xFFF0_0000;
+                phys_base | (vaddr & 0x000F_FFFF)
+            }
+            0b01 => {
+                let l2_base = descriptor & 0xFFFF_FC00;
+                let l2_index = (vaddr >> 12) & 0xFF;
+                let l2_desc_addr = l2_base | (l2_index << 2);
+                let l2_desc = self.mmu.read_u32(l2_desc_addr);
+                if (l2_desc & 0b11) == 0b10 {
+                    let phys_base = l2_desc & 0xFFFF_F000;
+                    phys_base | (vaddr & 0x0000_0FFF)
+                } else {
+                    vaddr
+                }
+            }
+            _ => vaddr,
+        }
+    }
+
+    /// Disassembles the instruction at a virtual address.
+    pub fn disassemble_at(&self, vaddr: u32) -> String {
+        let paddr = self.translate_address_debug(vaddr);
+        let instr = self.mmu.read_u32(paddr);
         Self::disassemble_instruction(instr)
     }
 
@@ -940,7 +1028,7 @@ impl Cpu {
         // ── HLE BIOS Intercept ────────────────────────────────────────
         // If the PC has reached the SWI vector (0x08) AND we are in Supervisor mode,
         // intercept execution to handle the syscall in Rust instead of executing ARM code.
-        if self.regs.pc() == SWI_VECTOR && self.regs.cpu_mode() == MODE_SVC {
+        if self.hle_bios_enabled && self.regs.pc() == SWI_VECTOR && self.regs.cpu_mode() == MODE_SVC {
             self.handle_bios_syscall();
             self.tick_sp804_timer();
             return true;
@@ -948,6 +1036,15 @@ impl Cpu {
 
         // ── FETCH ─────────────────────────────────────────────────────
         let instr = self.fetch();
+
+        // If fetch translation/permission raised an exception (e.g., abort),
+        // do not advance PC or decode a synthetic zero instruction.
+        // The exception handler already set PC to the vector entry.
+        if self.exception_raised {
+            self.tick_sp804_timer();
+            return true;
+        }
+
         let pc_at_fetch = self.regs.pc();
         self.advance_pc();
 
@@ -995,7 +1092,13 @@ impl Cpu {
                     self.cp15.write_register(crn, crm, opc1, opc2, val);
                 }
             } else {
-                self.log_unimplemented("Coprocessor Transfer", instr, pc_at_fetch);
+                #[cfg(not(test))]
+                {
+                    crate::log(&format!(
+                        "⚠️ Ignoring unsupported coprocessor transfer: instr={:#010X} pc={:#010X}",
+                        instr, pc_at_fetch
+                    ));
+                }
             }
 
             self.regs.pipeline_offset = 0;
@@ -1010,8 +1113,20 @@ impl Cpu {
         match bits_27_25 {
             // 000 = Data Processing (register) / Multiply / Misc
             0b000 => {
+                // MRS (PSR -> register): cond 00010 R 00 1111 Rd 0000 0000 0000
+                if (instr & 0x0FBF_0FFF) == 0x010F_0000 {
+                    self.execute_mrs(instr);
+                }
+                // MSR (register): cond 00010 R 10 field_mask 1111 0000 0000 Rm
+                else if (instr & 0x0DB0_F000) == 0x0120_F000 && (instr & 0x0000_0FF0) == 0 {
+                    self.execute_msr_register(instr);
+                }
+                // CLZ (count leading zeros): cond 0001 0110 1111 Rd 1111 0001 Rm
+                else if (instr & 0x0FFF_0FF0) == 0x016F_0F10 {
+                    self.execute_clz(instr);
+                }
                 // Check for Multiply (short & long): bits [27:24] = 0000, bits [7:4] = 1001
-                if (instr & 0x0F00_00F0) == 0x0000_0090 {
+                else if (instr & 0x0F00_00F0) == 0x0000_0090 {
                     self.execute_multiply(instr);
                 }
                 // Check for BLX (register): bits [27:4] = 0x012FFF3
@@ -1041,15 +1156,29 @@ impl Cpu {
             0b100 => self.execute_block_data_transfer(instr),
             // 101 = Branch (B / BL)
             0b101 => self.execute_branch(instr, pc_at_fetch),
-            // 110 = Coprocessor
-            0b110 => self.log_unimplemented("Coprocessor", instr, pc_at_fetch),
+            // 110 = Coprocessor data ops / load-store (ignored in this model)
+            0b110 => {
+                #[cfg(not(test))]
+                {
+                    crate::log(&format!(
+                        "⚠️ Ignoring unsupported coprocessor op: instr={:#010X} pc={:#010X}",
+                        instr, pc_at_fetch
+                    ));
+                }
+            }
             // 111 = Software Interrupt (SWI) / Coprocessor
             0b111 => {
                 // SWI is identified by bit 24 = 1
                 if (instr >> 24) & 1 == 1 {
                     self.execute_swi(instr, pc_at_fetch);
                 } else {
-                    self.log_unimplemented("Coprocessor", instr, pc_at_fetch);
+                    #[cfg(not(test))]
+                    {
+                        crate::log(&format!(
+                            "⚠️ Ignoring unsupported coprocessor op: instr={:#010X} pc={:#010X}",
+                            instr, pc_at_fetch
+                        ));
+                    }
                 }
             }
             _ => unreachable!(),
@@ -1124,16 +1253,104 @@ impl Cpu {
         }
     }
 
-    /// Decodes the register operand2 field, including barrel shift.
-    ///
-    /// Encoding: [11:8]=shift_amount [6:5]=shift_type [4]=0 [3:0]=Rm
-    ///   (bit 4 = 0: shift by immediate, bit 4 = 1: shift by register — we handle immediate here)
-    fn decode_register_operand(&self, instr: u32) -> u32 {
+    /// Decodes ARM Operand2 in register form and returns (value, shifter_carry_out).
+    fn decode_register_operand(&self, instr: u32) -> (u32, bool) {
         let rm = (instr & 0xF) as usize;
         let rm_val = self.regs.read(rm);
         let shift_type = ((instr >> 5) & 0x3) as u8;
-        let shift_amount = (instr >> 7) & 0x1F;
-        Self::shift_operand(rm_val, shift_type, shift_amount)
+        let shift_by_register = ((instr >> 4) & 1) == 1;
+        let old_c = self.regs.flag_c();
+
+        if shift_by_register {
+            // Register shift: amount from low byte of Rs.
+            let rs = ((instr >> 8) & 0xF) as usize;
+            let shift_amount = self.regs.read(rs) & 0xFF;
+
+            if shift_amount == 0 {
+                return (rm_val, old_c);
+            }
+
+            let (result, carry_out) = match shift_type {
+                0 => { // LSL by register
+                    if shift_amount == 32 {
+                        (0, (rm_val & 1) != 0)
+                    } else if shift_amount > 32 {
+                        (0, false)
+                    } else {
+                        (rm_val << shift_amount, ((rm_val >> (32 - shift_amount)) & 1) != 0)
+                    }
+                }
+                1 => { // LSR by register
+                    if shift_amount >= 32 {
+                        (0, ((rm_val >> 31) & 1) != 0)
+                    } else {
+                        (rm_val >> shift_amount, ((rm_val >> (shift_amount - 1)) & 1) != 0)
+                    }
+                }
+                2 => { // ASR by register
+                    if shift_amount >= 32 {
+                        let sign = (rm_val & 0x8000_0000) != 0;
+                        (if sign { 0xFFFF_FFFF } else { 0 }, sign)
+                    } else {
+                        (((rm_val as i32) >> shift_amount) as u32, ((rm_val >> (shift_amount - 1)) & 1) != 0)
+                    }
+                }
+                3 => { // ROR by register (amount mod 32)
+                    let rot = shift_amount & 0x1F;
+                    if rot == 0 {
+                        (rm_val, ((rm_val >> 31) & 1) != 0)
+                    } else {
+                        let result = rm_val.rotate_right(rot);
+                        (result, ((result >> 31) & 1) != 0)
+                    }
+                }
+                _ => (rm_val, old_c),
+            };
+
+            return (result, carry_out);
+        }
+
+        // Immediate shift: amount from bits [11:7], with ARM special encodings.
+        let shift_imm = (instr >> 7) & 0x1F;
+        match shift_type {
+            0 => {
+                if shift_imm == 0 {
+                    (rm_val, old_c)
+                } else {
+                    (rm_val << shift_imm, ((rm_val >> (32 - shift_imm)) & 1) != 0)
+                }
+            }
+            1 => {
+                // LSR #0 means LSR #32
+                let amount = if shift_imm == 0 { 32 } else { shift_imm };
+                if amount == 32 {
+                    (0, ((rm_val >> 31) & 1) != 0)
+                } else {
+                    (rm_val >> amount, ((rm_val >> (amount - 1)) & 1) != 0)
+                }
+            }
+            2 => {
+                // ASR #0 means ASR #32
+                let amount = if shift_imm == 0 { 32 } else { shift_imm };
+                if amount == 32 {
+                    let sign = (rm_val & 0x8000_0000) != 0;
+                    (if sign { 0xFFFF_FFFF } else { 0 }, sign)
+                } else {
+                    (((rm_val as i32) >> amount) as u32, ((rm_val >> (amount - 1)) & 1) != 0)
+                }
+            }
+            3 => {
+                if shift_imm == 0 {
+                    // ROR #0 encodes RRX.
+                    let c_in = if self.regs.flag_c() { 1u32 } else { 0u32 };
+                    ((c_in << 31) | (rm_val >> 1), (rm_val & 1) != 0)
+                } else {
+                    let result = rm_val.rotate_right(shift_imm);
+                    (result, ((result >> 31) & 1) != 0)
+                }
+            }
+            _ => (rm_val, old_c),
+        }
     }
 
     // ── Data Processing ───────────────────────────────────────────────
@@ -1154,11 +1371,17 @@ impl Cpu {
         let rd = ((instr >> 12) & 0xF) as usize;
 
         // Compute operand2
-        let op2 = if is_imm {
+        let (op2, shifter_carry) = if is_imm {
             // Immediate: 8-bit value rotated right by 2 * rotate
             let imm8 = instr & 0xFF;
             let rotate = ((instr >> 8) & 0xF) * 2;
-            imm8.rotate_right(rotate)
+            let value = imm8.rotate_right(rotate);
+            let carry = if rotate == 0 {
+                self.regs.flag_c()
+            } else {
+                ((value >> 31) & 1) != 0
+            };
+            (value, carry)
         } else {
             // Register with barrel shift
             self.decode_register_operand(instr)
@@ -1172,13 +1395,19 @@ impl Cpu {
             0x0 => {
                 let result = rn_val & op2;
                 self.regs.write(rd, result);
-                if set_flags { self.regs.update_nz(result); }
+                if set_flags {
+                    self.regs.update_nz(result);
+                    self.regs.set_flag_c(shifter_carry);
+                }
             }
             // 0001 = EOR (XOR)
             0x1 => {
                 let result = rn_val ^ op2;
                 self.regs.write(rd, result);
-                if set_flags { self.regs.update_nz(result); }
+                if set_flags {
+                    self.regs.update_nz(result);
+                    self.regs.set_flag_c(shifter_carry);
+                }
             }
             // 0010 = SUB
             0x2 => {
@@ -1202,6 +1431,18 @@ impl Cpu {
                     self.regs.set_flag_v(overflow);
                 }
             }
+            // 1000 = TST (test — like AND, result discarded, flags updated)
+            0x8 => {
+                let result = rn_val & op2;
+                self.regs.update_nz(result);
+                self.regs.set_flag_c(shifter_carry);
+            }
+            // 1001 = TEQ (test equivalence — like EOR, result discarded)
+            0x9 => {
+                let result = rn_val ^ op2;
+                self.regs.update_nz(result);
+                self.regs.set_flag_c(shifter_carry);
+            }
             // 1010 = CMP (compare — like SUB but result discarded)
             0xA => {
                 let result = rn_val.wrapping_sub(op2);
@@ -1211,33 +1452,94 @@ impl Cpu {
                 let overflow = ((rn_val ^ op2) & (rn_val ^ result)) >> 31 != 0;
                 self.regs.set_flag_v(overflow);
             }
+            // 1011 = CMN (compare negative — like ADD but result discarded)
+            0xB => {
+                let result = rn_val.wrapping_add(op2);
+                self.regs.update_nz(result);
+                self.regs.set_flag_c(result < rn_val || result < op2);
+                let overflow = (!((rn_val ^ op2)) & (rn_val ^ result)) >> 31 != 0;
+                self.regs.set_flag_v(overflow);
+            }
             // 1100 = ORR
             0xC => {
                 let result = rn_val | op2;
                 self.regs.write(rd, result);
-                if set_flags { self.regs.update_nz(result); }
+                if set_flags {
+                    self.regs.update_nz(result);
+                    self.regs.set_flag_c(shifter_carry);
+                }
             }
             // 1101 = MOV (Rd = op2, Rn ignored)
             0xD => {
                 self.regs.write(rd, op2);
-                if set_flags { self.regs.update_nz(op2); }
+                if set_flags {
+                    self.regs.update_nz(op2);
+                    self.regs.set_flag_c(shifter_carry);
+                }
             }
             // 1110 = BIC (bit clear: Rd = Rn AND NOT op2)
             0xE => {
                 let result = rn_val & !op2;
                 self.regs.write(rd, result);
-                if set_flags { self.regs.update_nz(result); }
+                if set_flags {
+                    self.regs.update_nz(result);
+                    self.regs.set_flag_c(shifter_carry);
+                }
             }
             // 1111 = MVN (move NOT: Rd = NOT op2)
             0xF => {
                 let result = !op2;
                 self.regs.write(rd, result);
-                if set_flags { self.regs.update_nz(result); }
+                if set_flags {
+                    self.regs.update_nz(result);
+                    self.regs.set_flag_c(shifter_carry);
+                }
             }
             _ => {
                 // Unimplemented data processing opcode
             }
         }
+    }
+
+    fn execute_mrs(&mut self, instr: u32) {
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let use_spsr = ((instr >> 22) & 1) == 1;
+        let val = if use_spsr {
+            self.regs.spsr(self.regs.cpu_mode())
+        } else {
+            self.regs.cpsr()
+        };
+        self.regs.write(rd, val);
+    }
+
+    fn execute_msr_register(&mut self, instr: u32) {
+        let use_spsr = ((instr >> 22) & 1) == 1;
+        let field_mask = (instr >> 16) & 0xF;
+        let rm = (instr & 0xF) as usize;
+        let src = self.regs.read(rm);
+
+        let mut mask = 0u32;
+        if (field_mask & 0x1) != 0 { mask |= 0x0000_00FF; } // c
+        if (field_mask & 0x2) != 0 { mask |= 0x0000_FF00; } // x
+        if (field_mask & 0x4) != 0 { mask |= 0x00FF_0000; } // s
+        if (field_mask & 0x8) != 0 { mask |= 0xFF00_0000; } // f
+
+        if use_spsr {
+            let current = self.regs.spsr(self.regs.cpu_mode());
+            let updated = (current & !mask) | (src & mask);
+            self.regs.set_spsr(self.regs.cpu_mode(), updated);
+        } else {
+            let current = self.regs.cpsr();
+            let updated = (current & !mask) | (src & mask);
+            self.regs.set_cpsr(updated);
+        }
+    }
+
+    fn execute_clz(&mut self, instr: u32) {
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let rm = (instr & 0xF) as usize;
+        let val = self.regs.read(rm);
+        self.regs.write(rd, val.leading_zeros());
     }
 
     // ── Branch ────────────────────────────────────────────────────────
@@ -1464,7 +1766,59 @@ impl Cpu {
 
     /// Executes a Software Interrupt (SWI / SVC) instruction.
     fn execute_swi(&mut self, instr: u32, pc_at_fetch: u32) {
-        let _ = (instr, pc_at_fetch);
+        let _ = pc_at_fetch;
+        let swi_number = instr & 0x00FF_FFFF;
+
+        // Semihosting magic SWI used by some kernels/boot paths for diagnostic output.
+        if swi_number == 0x123456 {
+            let op = self.regs.read(0);   // operation type
+            let arg = self.regs.read(1);  // argument pointer
+
+            match op {
+                0x04 => {
+                    // SYS_WRITE0: print null-terminated string at [arg]
+                    let mut ptr = arg;
+                    let mut output = String::new();
+                    loop {
+                        let c = self.mmu.read_u8(ptr);
+                        if c == 0 {
+                            break;
+                        }
+                        output.push(c as char);
+                        ptr = ptr.wrapping_add(1);
+                    }
+
+                    #[cfg(not(test))]
+                    {
+                        crate::log(&format!("📝 KERNEL PANIC REASON: {}", output.trim_end()));
+                    }
+
+                    // Bypass normal SWI exception handling for semihosting write.
+                    return;
+                }
+                0x17 => {
+                    // SYS_EXIT: guest requests termination.
+                    #[cfg(not(test))]
+                    {
+                        let arg_word = self.mmu.read_u32(arg);
+                        crate::log(&format!(
+                            "🛑 Semihosting SYS_EXIT: reason={:#X}, arg_word={:#010X}",
+                            arg, arg_word
+                        ));
+                    }
+                    self.halted = true;
+                    return;
+                }
+                _ => {
+                    #[cfg(not(test))]
+                    {
+                        crate::log(&format!("⚠️ Unimplemented Semihosting Op: {:#X}", op));
+                    }
+                    return;
+                }
+            }
+        }
+
         self.trigger_exception("SWI", MODE_SVC, 0x08, 4);
     }
 
@@ -1547,7 +1901,7 @@ impl Cpu {
         // Compute the offset
         let offset = if is_reg_offset {
             // Register offset with barrel shift
-            self.decode_register_operand(instr)
+            self.decode_register_operand(instr).0
         } else {
             // 12-bit immediate offset
             instr & 0xFFF

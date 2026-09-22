@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub mod memory;
 pub mod cpu;
 pub mod cp15;
+pub mod android;
 
 // ── Browser bindings ──────────────────────────────────────────────────
 #[wasm_bindgen]
@@ -190,22 +191,36 @@ use std::cell::RefCell;
 
 thread_local! {
     static ARM_CPU: RefCell<Option<cpu::Cpu>> = RefCell::new(None);
+    static APK_RT: RefCell<Option<android::AppRuntime>> = RefCell::new(None);
 }
 
+const MAX_UPLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MiB APK/ROM soft cap
+
+
 /// Initializes the emulator with configurable RAM.
-/// `ram_mb` is the RAM size in megabytes (e.g. 512, 1024, 2048).
-/// Pass 0 for the default (128 MB).
+/// `ram_mb` is megabytes. Pass 0 for default 512. Soft-caps at 1024 in browser-friendly mode
+/// unless the caller explicitly requests more (max 4096).
 #[wasm_bindgen]
 pub fn init_emulator(ram_mb: u32) {
-    log("🐱 nekodroid: Wasm CPU Emulator Initialized!");
+    log("nekodroid: Wasm CPU emulator initialized");
 
-    let ram_bytes = if ram_mb == 0 { 128 } else { ram_mb as usize } * 1024 * 1024;
+    let ram_mb = if ram_mb == 0 {
+        512
+    } else {
+        ram_mb.min(4096)
+    };
+    if ram_mb > 1024 {
+        log(&format!(
+            "warning: allocating {ram_mb} MB RAM; large tabs may OOM in some browsers"
+        ));
+    }
+    let ram_bytes = ram_mb as usize * 1024 * 1024;
     let mut arm_cpu = cpu::Cpu::new(ram_bytes);
     arm_cpu.regs.set_pc(0x0000_8000);
     arm_cpu.regs.set_sp((ram_bytes as u32).wrapping_sub(0x1_0000));
 
     log(&format!(
-        "🔧 ARMv7 CPU ready — PC: {:#010X}, SP: {:#010X}, RAM: {} MB",
+        "ARMv7 CPU ready — PC: {:#010X}, SP: {:#010X}, RAM: {} MB",
         arm_cpu.regs.pc(),
         arm_cpu.regs.sp(),
         ram_bytes / (1024 * 1024)
@@ -221,8 +236,8 @@ pub fn init_emulator(ram_mb: u32) {
 #[wasm_bindgen]
 pub fn get_cpu_state() -> String {
     ARM_CPU.with(|cell| {
-        let borrow = cell.borrow();
-        match borrow.as_ref() {
+        let mut borrow = cell.borrow_mut();
+        match borrow.as_mut() {
             Some(cpu) => {
                 let regs: Vec<String> = (0..16)
                     .map(|i| cpu.regs.read(i).to_string())
@@ -283,6 +298,9 @@ pub fn step_cpu() -> bool {
 /// Returns the actual number of instructions executed (will be less than `count` if halted).
 #[wasm_bindgen]
 pub fn run_batch(count: u32, timer_interval: u32) -> u32 {
+    // Guard against divide-by-zero from host calls.
+    let safe_interval = if timer_interval == 0 { 200_000 } else { timer_interval };
+
     ARM_CPU.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if let Some(cpu) = borrow.as_mut() {
@@ -294,7 +312,7 @@ pub fn run_batch(count: u32, timer_interval: u32) -> u32 {
                 executed += 1;
 
                 // Tick the internal hardware timer
-                if i % timer_interval == 0 {
+                if i % safe_interval == 0 {
                     cpu.mmu.sys_timer = cpu.mmu.sys_timer.wrapping_add(1);
                 }
             }
@@ -453,15 +471,351 @@ pub fn load_rom(bytes: &[u8]) -> bool {
 
 /// Loads and boots a Linux kernel zImage/Image.
 #[wasm_bindgen]
-pub fn boot_linux_kernel(bytes: &[u8]) -> bool {
+pub fn boot_linux_kernel(kernel_bytes: &[u8], initrd_bytes: &[u8]) -> bool {
     ARM_CPU.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if let Some(cpu) = borrow.as_mut() {
-            cpu.boot_linux(bytes, 0x0183);
+            let initrd = if initrd_bytes.is_empty() { None } else { Some(initrd_bytes) };
+            cpu.boot_linux(kernel_bytes, initrd, 0x00E2);
             CYCLE_COUNT.store(0, Ordering::Relaxed);
             true
         } else {
             false
         }
     })
+}
+
+/// Returns the current CP15 MIDR value from the emulated CPU.
+#[wasm_bindgen]
+pub fn get_cp15_midr() -> u32 {
+    ARM_CPU.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(cpu) => cpu.cp15.c0_midr,
+            None => 0,
+        }
+    })
+}
+
+// ── Android APK & System Image Support ────────────────────────────────
+
+/// Mounts an Android system image (ext4 partition) for the emulator.
+/// This makes the Android framework available to loaded APKs.
+#[wasm_bindgen]
+pub fn mount_system_image(image_bytes: &[u8]) -> bool {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(cpu) = borrow.as_mut() {
+            cpu.mmu.mmc_card_data = Some(image_bytes.to_vec());
+            log(&format!("🤖 Android system image mounted: {} bytes", image_bytes.len()));
+            true
+        } else {
+            log("❌ Cannot mount system image: CPU not initialized");
+            false
+        }
+    })
+}
+
+/// Loads an APK into the HLE Dalvik runtime (does not boot a full Android OS).
+#[wasm_bindgen]
+pub fn load_apk(apk_bytes: &[u8]) -> bool {
+    if apk_bytes.len() > MAX_UPLOAD_BYTES {
+        log(&format!(
+            "APK rejected: {} bytes exceeds {} byte limit",
+            apk_bytes.len(),
+            MAX_UPLOAD_BYTES
+        ));
+        return false;
+    }
+    match android::AppRuntime::load(apk_bytes) {
+        Ok(rt) => {
+            log(&format!(
+                "APK loaded: {} bytes, package={}, classes={}",
+                apk_bytes.len(),
+                rt.apk.package_name,
+                rt.apk.dex.classes.len()
+            ));
+            APK_RT.with(|cell| *cell.borrow_mut() = Some(rt));
+            true
+        }
+        Err(e) => {
+            log(&format!("APK load failed: {e}"));
+            false
+        }
+    }
+}
+
+/// JSON info for the currently loaded APK/HLE session.
+#[wasm_bindgen]
+pub fn get_apk_info() -> String {
+    APK_RT.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|rt| rt.info_json())
+            .unwrap_or_else(|| r#"{"error":"no apk loaded"}"#.into())
+    })
+}
+
+/// Launch the loaded APK entry (main or onCreate) on the HLE VM.
+#[wasm_bindgen]
+pub fn launch_apk() -> bool {
+    APK_RT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        match borrow.as_mut() {
+            Some(rt) => match rt.launch() {
+                Ok(()) => {
+                    log("APK launched on HLE Dalvik VM");
+                    true
+                }
+                Err(e) => {
+                    log(&format!("APK launch failed: {e}"));
+                    false
+                }
+            },
+            None => {
+                log("launch_apk: no APK loaded");
+                false
+            }
+        }
+    })
+}
+
+/// Step the HLE Dalvik VM once. Returns false if halted or no APK.
+#[wasm_bindgen]
+pub fn step_dalvik() -> bool {
+    APK_RT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        match borrow.as_mut() {
+            Some(rt) => rt.step().unwrap_or(false),
+            None => false,
+        }
+    })
+}
+
+/// Run up to `count` Dalvik VM steps. Returns steps executed.
+#[wasm_bindgen]
+pub fn run_dalvik_batch(count: u32) -> u32 {
+    APK_RT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        match borrow.as_mut() {
+            Some(rt) => rt.run_batch(count).unwrap_or(0),
+            None => 0,
+        }
+    })
+}
+
+/// HLE logcat-style lines from the Dalvik session (plus canvas text).
+#[wasm_bindgen]
+pub fn get_dalvik_logs() -> String {
+    APK_RT.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|rt| rt.logs_text())
+            .unwrap_or_default()
+    })
+}
+
+/// Draw HLE canvas_text into the CPU VRAM as a simple bitmap message.
+#[wasm_bindgen]
+pub fn blit_dalvik_text_to_vram() -> bool {
+    APK_RT.with(|apk| {
+        let text = apk
+            .borrow()
+            .as_ref()
+            .map(|rt| rt.canvas_text())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return false;
+        }
+        ARM_CPU.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let Some(cpu) = borrow.as_mut() else {
+                return false;
+            };
+            draw_text_vram(&mut cpu.mmu, &text);
+            true
+        })
+    })
+}
+
+fn draw_text_vram(mmu: &mut memory::Mmu, text: &str) {
+    // Fill dark background
+    let w = memory::VRAM_WIDTH;
+    let h = memory::VRAM_HEIGHT;
+    for y in 0..h {
+        for x in 0..w {
+            let off = (y * w + x) * 4;
+            if off + 3 < mmu.vram_len() {
+                // direct via write path
+                let addr = memory::VRAM_BASE + off as u32;
+                mmu.write_u8(addr, 12);
+                mmu.write_u8(addr + 1, 14);
+                mmu.write_u8(addr + 2, 22);
+                mmu.write_u8(addr + 3, 255);
+            }
+        }
+    }
+    // Simple 8x8 block font for ASCII: draw each char as a filled cell pattern
+    let mut cx = 16usize;
+    let mut cy = 24usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            cy += 16;
+            cx = 16;
+            continue;
+        }
+        if cx + 8 >= w {
+            cy += 16;
+            cx = 16;
+        }
+        if cy + 8 >= h {
+            break;
+        }
+        let glyph = ch as u8;
+        for gy in 0..8 {
+            for gx in 0..8 {
+                let on = ((glyph.wrapping_mul(31).wrapping_add(gx as u8 * 3).wrapping_add(gy as u8))
+                    % 7)
+                    < 3
+                    || (gx == 0 || gy == 0 || gx == 7 || gy == 7);
+                if on {
+                    let x = cx + gx;
+                    let y = cy + gy;
+                    let addr = memory::VRAM_BASE + ((y * w + x) * 4) as u32;
+                    mmu.write_u8(addr, 240);
+                    mmu.write_u8(addr + 1, 240);
+                    mmu.write_u8(addr + 2, 245);
+                    mmu.write_u8(addr + 3, 255);
+                }
+            }
+        }
+        // Also punch readable ASCII as a second row of brighter pixels keyed by char code
+        let bar = (glyph as usize % 40) + 1;
+        for i in 0..bar.min(8) {
+            let addr = memory::VRAM_BASE + (((cy + 10) * w + cx + i) * 4) as u32;
+            mmu.write_u8(addr, 80);
+            mmu.write_u8(addr + 1, 200);
+            mmu.write_u8(addr + 2, 120);
+            mmu.write_u8(addr + 3, 255);
+        }
+        cx += 10;
+    }
+}
+
+
+/// Boots an Android kernel with system image and optional APK.
+/// This is the main entry point for running Android apps.
+/// 
+/// # Arguments
+/// * `kernel_bytes` - The Android kernel zImage (e.g., goldfish_defconfig)
+/// * `system_img` - The Android system image (ext4 format)
+/// * `ramdisk_img` - Optional initramfs (can be empty)
+/// * `apk_bytes` - Optional APK to auto-launch after boot (can be empty)
+#[wasm_bindgen]
+pub fn boot_android(kernel_bytes: &[u8], system_img: &[u8], ramdisk_img: &[u8], apk_bytes: &[u8]) -> bool {
+    ARM_CPU.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(cpu) = borrow.as_mut() {
+            // Mount system image first
+            if !system_img.is_empty() {
+                cpu.mmu.mmc_card_data = Some(system_img.to_vec());
+                log(&format!("🤖 Android system mounted: {} MB", system_img.len() / (1024*1024)));
+            }
+            
+            // Set up Android-specific boot parameters
+            let initrd = if ramdisk_img.is_empty() { None } else { Some(ramdisk_img) };
+            
+            // Boot with Android machine ID (goldfish = 0x46F, versatile = 0x183)
+            // Android emulator uses goldfish machine ID
+            cpu.boot_linux(kernel_bytes, initrd, 0x046F);
+            
+            // Set Android-specific boot args registers
+            // R1 = machine type (already set by boot_linux)
+            // R2 = atags pointer (already set)
+            
+            CYCLE_COUNT.store(0, Ordering::Relaxed);
+            
+            if !apk_bytes.is_empty() {
+                log(&format!("📦 APK queued for launch: {} bytes", apk_bytes.len()));
+                // TODO: Auto-launch APK after system boot completes
+                // This requires detecting when init finishes and launching the app
+            }
+            
+            log("🚀 Android boot initiated (Goldfish machine: 0x46F)");
+            true
+        } else {
+            log("❌ Cannot boot Android: CPU not initialized");
+            false
+        }
+    })
+}
+
+/// Returns the Android logger buffer as a formatted string for display.
+/// Useful for seeing logcat output from the emulated Android system.
+#[wasm_bindgen]
+pub fn get_android_logs() -> String {
+    ARM_CPU.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(cpu) => {
+                let mut output = String::new();
+                for entry in &cpu.mmu.logger_buffer {
+                    let level = match entry.priority {
+                        2 => "V",
+                        3 => "D",
+                        4 => "I",
+                        5 => "W",
+                        6 => "E",
+                        _ => "?",
+                    };
+                    output.push_str(&format!("{} [{}] {}\n", level, entry.tag, entry.message));
+                }
+                output
+            }
+            None => "Android logger not available (CPU not initialized)".to_string(),
+        }
+    })
+}
+
+/// Forward host touch into the HLE APK runtime (MotionEvent stubs).
+#[wasm_bindgen]
+pub fn dalvik_touch(x: i32, y: i32, is_down: bool) {
+    APK_RT.with(|cell| {
+        if let Some(rt) = cell.borrow_mut().as_mut() {
+            rt.vm.host.touch_x = x;
+            rt.vm.host.touch_y = y;
+            rt.vm.host.touch_down = is_down;
+        }
+    });
+}
+
+/// Clears the Android logger buffer.
+#[wasm_bindgen]
+pub fn clear_android_logs() {
+    ARM_CPU.with(|cell| {
+        if let Some(cpu) = cell.borrow_mut().as_mut() {
+            cpu.mmu.logger_buffer.clear();
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_boot_linux_kernel_wrapper_uses_machine_id_00e2() {
+        ARM_CPU.with(|cell| {
+            *cell.borrow_mut() = Some(cpu::Cpu::new(16 * 1024 * 1024));
+        });
+
+        let kernel = [0x00, 0x00, 0xA0, 0xE3]; // MOV R0, #0
+        assert!(boot_linux_kernel(&kernel, &[]));
+
+        ARM_CPU.with(|cell| {
+            let borrow = cell.borrow();
+            let cpu = borrow.as_ref().expect("CPU should be initialized");
+            assert_eq!(cpu.regs.read(1), 0x00E2);
+        });
+    }
 }

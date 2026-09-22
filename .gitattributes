@@ -1,0 +1,19 @@
+# Keep source line endings stable (avoids noisy Windows CRLF commits)
+* text=auto eol=lf
+
+# Binary fixtures / demos — never treat as text
+*.bin binary
+*.elf binary
+*.apk binary
+*.dex binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.wasm binary
+*.ico binary
+*.svg binary
+*.zImage binary
+*.img binary
+*.gz binary

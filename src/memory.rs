@@ -8,10 +8,10 @@ const DEFAULT_RAM_SIZE: usize = 16 * 1024 * 1024;
 
 // ── MMIO Address Map ──────────────────────────────────────────────────
 // VRAM — 800×600 RGBA framebuffer at 0x04000000
-const VRAM_BASE: u32 = 0x0400_0000;
-const VRAM_WIDTH: usize = 800;
-const VRAM_HEIGHT: usize = 600;
-const VRAM_SIZE: usize = VRAM_WIDTH * VRAM_HEIGHT * 4; // 1,920,000 bytes
+pub const VRAM_BASE: u32 = 0x0400_0000;
+pub const VRAM_WIDTH: usize = 800;
+pub const VRAM_HEIGHT: usize = 600;
+pub const VRAM_SIZE: usize = VRAM_WIDTH * VRAM_HEIGHT * 4; // 1,920,000 bytes
 const VRAM_END:  u32 = VRAM_BASE + VRAM_SIZE as u32;   // 0x041D4C00
 
 // Virtual UART (serial port) — base address 0x10000000
@@ -43,6 +43,87 @@ const VPB_UART0_FR: u32   = VPB_UART0_BASE + 0x18; // Flag Register
 // Versatile PB peripheral window
 const VPB_PERIPH_START: u32 = 0x1010_0000;
 const VPB_PERIPH_END: u32   = 0x101F_FFFF;
+
+// ── Android-specific MMIO regions ─────────────────────────────────────
+// Goldfish GPU / Framebuffer (for Android graphics)
+const GOLDFISH_FB_BASE: u32 = 0x1F00_0000;
+const GOLDFISH_FB_SIZE: u32 = 0x0100_0000; // 16MB for high-res framebuffer
+
+// Goldfish Pipe (for host communication, used by Android)
+const GOLDFISH_PIPE_BASE: u32 = 0x1D00_0000;
+const GOLDFISH_PIPE_SIZE: u32 = 0x0010_0000;
+
+// Android Binder IPC driver MMIO region
+const BINDER_BASE: u32 = 0x0A00_0000; // Moved to avoid VRAM conflict
+const BINDER_SIZE: u32 = 0x0010_0000;
+
+// Goldfish RTC (Real-Time Clock for Android)
+const GOLDFISH_RTC_BASE: u32 = 0x1010_1000;
+
+// SD/MMC Card interface (for mounting Android system images)
+const MMC_BASE: u32 = 0x1C00_0000;
+const MMC_SIZE: u32 = 0x0001_0000;
+
+// MMC Command register offsets
+const MMC_REG_CMD: u32 = 0x00;      // Command register
+const MMC_REG_ARG: u32 = 0x04;      // Argument (sector address)
+const MMC_REG_RESP: u32 = 0x08;     // Response
+const MMC_REG_STATUS: u32 = 0x0C;    // Status
+const MMC_REG_DATA: u32 = 0x10;      // Data port
+const MMC_REG_CTRL: u32 = 0x14;     // Control
+
+// MMC Commands
+const MMC_CMD_READ_SINGLE: u32 = 17;  // CMD17: READ_SINGLE_BLOCK
+const MMC_CMD_READ_MULTIPLE: u32 = 18; // CMD18: READ_MULTIPLE_BLOCK
+#[allow(dead_code)]
+const MMC_CMD_WRITE_SINGLE: u32 = 24; // CMD24: WRITE_SINGLE_BLOCK
+const MMC_CMD_SEND_STATUS: u32 = 13;  // CMD13: SEND_STATUS
+const MMC_CMD_APP_CMD: u32 = 55;      // CMD55: APP_CMD
+#[allow(dead_code)]
+const MMC_CMD_SD_SEND_OP_COND: u32 = 41; // ACMD41: SD_SEND_OP_COND
+
+// Android Logger (logcat) interface
+const ANDROID_LOG_BASE: u32 = 0x1E00_0000;
+const ANDROID_LOG_SIZE: u32 = 0x0001_0000;
+
+// Logger register offsets
+const LOG_REG_PRIO: u32 = 0x00;     // Priority (VERBOSE=2, DEBUG=3, INFO=4, WARN=5, ERROR=6)
+const LOG_REG_TAG: u32 = 0x04;      // Tag string pointer (32-bit address)
+const LOG_REG_MSG: u32 = 0x08;      // Message string pointer (32-bit address)
+const LOG_REG_CTRL: u32 = 0x0C;     // Control: bit0=write trigger
+const LOG_REG_STATUS: u32 = 0x10;   // Status: bit0=ready, bit1=buffer full
+
+// Android log priorities
+#[allow(dead_code)]
+const LOG_PRIO_VERBOSE: u8 = 2;
+#[allow(dead_code)]
+const LOG_PRIO_DEBUG: u8 = 3;
+#[allow(dead_code)]
+const LOG_PRIO_INFO: u8 = 4;
+#[allow(dead_code)]
+const LOG_PRIO_WARN: u8 = 5;
+#[allow(dead_code)]
+const LOG_PRIO_ERROR: u8 = 6;
+#[allow(dead_code)]
+const LOG_PRIO_FATAL: u8 = 7;
+
+// ASHMEM (Anonymous Shared Memory) for Android Binder IPC
+const ASHMEM_BASE: u32 = 0x1B00_0000;
+const ASHMEM_SIZE: u32 = 0x0001_0000;
+
+// ASHMEM ioctl-like commands (simplified MMIO interface)
+const ASHMEM_REG_CMD: u32 = 0x00;      // Command register
+const ASHMEM_REG_SIZE: u32 = 0x04;     // Size register (set/get)
+const ASHMEM_REG_PROT: u32 = 0x08;     // Protection mask
+const ASHMEM_REG_PINNED: u32 = 0x0C;   // Pin status
+const ASHMEM_REG_DATA_PTR: u32 = 0x10; // Data pointer (returned after create)
+const ASHMEM_REG_STATUS: u32 = 0x14;   // Status: bit0=initialized
+
+// ASHMEM commands
+const ASHMEM_CMD_CREATE: u32 = 1;   // Create shared memory region
+const ASHMEM_CMD_PIN: u32 = 2;      // Pin region
+const ASHMEM_CMD_UNPIN: u32 = 3;    // Unpin region
+const ASHMEM_CMD_PURGE: u32 = 4;    // Purge all caches
 
 /// The Memory Management Unit — a flat byte-addressable memory bus
 /// with Memory-Mapped I/O (MMIO) support.
@@ -89,6 +170,105 @@ pub struct Mmu {
     pub vic_int_status: u32,
     /// Physical IRQ wire from VIC to CPU
     pub irq_pending: bool,
+    
+    // ── Android-specific state ─────────────────────────────────────────
+    /// Android logcat logger ring buffer
+    pub logger_buffer: Vec<LogEntry>,
+    /// Goldfish framebuffer state (width, height, format)
+    pub goldfish_fb_config: FbConfig,
+    /// SD/MMC card mounted image data
+    pub mmc_card_data: Option<Vec<u8>>,
+    /// Goldfish RTC time value
+    pub goldfish_rtc: u64,
+    /// Binder transaction sequence counter
+    pub binder_seq: u32,
+    
+    // ── SD/MMC Card Interface ──────────────────────────────────────────
+    /// MMC command register
+    pub mmc_cmd: u32,
+    /// MMC argument register (sector address)
+    pub mmc_arg: u32,
+    /// MMC response register
+    pub mmc_resp: u32,
+    /// MMC status register
+    pub mmc_status: u32,
+    /// MMC data register (for sector reads)
+    pub mmc_data: u32,
+    /// Current sector being read
+    pub mmc_current_sector: u32,
+    /// Sector data buffer (512 bytes for standard sector)
+    pub mmc_sector_buffer: [u8; 512],
+    /// Byte offset within sector buffer
+    pub mmc_buffer_offset: usize,
+    
+    // ── Android Logger ────────────────────────────────────────────────
+    /// Logger device read position
+    pub logger_read_pos: usize,
+    /// Logger device entries limit
+    pub logger_max_entries: usize,
+    /// Android Logger priority register
+    pub log_prio: u32,
+    /// Android Logger tag pointer register
+    pub log_tag_ptr: u32,
+    /// Android Logger message pointer register
+    pub log_msg_ptr: u32,
+    /// Android Logger control register
+    pub log_ctrl: u32,
+    
+    // ── ASHMEM (Anonymous Shared Memory) ─────────────────────────────
+    /// ASHMEM command register
+    pub ashmem_cmd: u32,
+    /// ASHMEM size register
+    pub ashmem_size: u32,
+    /// ASHMEM protection mask
+    pub ashmem_prot: u32,
+    /// ASHMEM pinned status
+    pub ashmem_pinned: u32,
+    /// ASHMEM data pointer (address in emulator RAM)
+    pub ashmem_data_ptr: u32,
+    /// ASHMEM status register
+    pub ashmem_status: u32,
+    /// Shared memory regions pool
+    pub ashmem_regions: Vec<SharedMemoryRegion>,
+}
+
+/// Android shared memory region (ASHMEM)
+#[derive(Debug, Clone)]
+pub struct SharedMemoryRegion {
+    pub id: u32,
+    pub size: usize,
+    pub data: Vec<u8>,
+    pub prot_mask: u32,
+    pub pinned: bool,
+    pub mapped_addr: Option<u32>, // If mapped, the virtual address
+}
+
+/// Android logcat entry
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub priority: u8,
+    pub tag: String,
+    pub message: String,
+}
+
+/// Goldfish framebuffer configuration
+#[derive(Debug, Clone, Copy)]
+pub struct FbConfig {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32, // 0=RGBA8888, 1=RGB565, etc.
+    pub enabled: bool,
+}
+
+impl Default for FbConfig {
+    fn default() -> Self {
+        Self {
+            width: 800,
+            height: 600,
+            format: 0, // RGBA8888
+            enabled: false,
+        }
+    }
 }
 
 impl Mmu {
@@ -116,6 +296,36 @@ impl Mmu {
             vic_int_enable: 0,
             vic_int_status: 0,
             irq_pending: false,
+            // Android fields
+            logger_buffer: Vec::with_capacity(1024),
+            goldfish_fb_config: FbConfig::default(),
+            mmc_card_data: None,
+            goldfish_rtc: 0,
+            binder_seq: 0,
+            // SD/MMC fields
+            mmc_cmd: 0,
+            mmc_arg: 0,
+            mmc_resp: 0,
+            mmc_status: 0,
+            mmc_data: 0,
+            mmc_current_sector: 0,
+            mmc_sector_buffer: [0u8; 512],
+            mmc_buffer_offset: 0,
+            // Android Logger fields
+            logger_read_pos: 0,
+            logger_max_entries: 1024,
+            log_prio: 0,
+            log_tag_ptr: 0,
+            log_msg_ptr: 0,
+            log_ctrl: 0,
+            // ASHMEM fields
+            ashmem_cmd: 0,
+            ashmem_size: 0,
+            ashmem_prot: 0,
+            ashmem_pinned: 0,
+            ashmem_data_ptr: 0,
+            ashmem_status: 0,
+            ashmem_regions: Vec::new(),
         }
     }
 
@@ -148,7 +358,27 @@ impl Mmu {
 
     /// Returns true if address is in any emulated peripheral range.
     fn is_periph(addr: u32) -> bool {
-        Self::is_uart(addr) || Self::is_vpb_periph(addr)
+        Self::is_uart(addr) || Self::is_vpb_periph(addr) || Self::is_android_periph(addr)
+    }
+
+    // ── Android MMIO detection ────────────────────────────────────────
+
+    /// Returns true if address is in Android-specific MMIO regions.
+    fn is_android_periph(addr: u32) -> bool {
+        // Goldfish GPU framebuffer
+        (addr >= GOLDFISH_FB_BASE && addr < GOLDFISH_FB_BASE + GOLDFISH_FB_SIZE) ||
+        // Goldfish Pipe
+        (addr >= GOLDFISH_PIPE_BASE && addr < GOLDFISH_PIPE_BASE + GOLDFISH_PIPE_SIZE) ||
+        // Binder IPC
+        (addr >= BINDER_BASE && addr < BINDER_BASE + BINDER_SIZE) ||
+        // SD/MMC card
+        (addr >= MMC_BASE && addr < MMC_BASE + MMC_SIZE) ||
+        // Goldfish RTC
+        (addr >= GOLDFISH_RTC_BASE && addr < GOLDFISH_RTC_BASE + 0x1000) ||
+        // Android Logger (logcat)
+        (addr >= ANDROID_LOG_BASE && addr < ANDROID_LOG_BASE + ANDROID_LOG_SIZE) ||
+        // ASHMEM (Anonymous Shared Memory)
+        (addr >= ASHMEM_BASE && addr < ASHMEM_BASE + ASHMEM_SIZE)
     }
 
     // ── UART TX ───────────────────────────────────────────────────────
@@ -225,6 +455,157 @@ impl Mmu {
         }
     }
 
+    // ── SD/MMC Command Execution ─────────────────────────────────────
+
+    /// Executes an MMC command that was written to the CMD register.
+    /// This handles sector reads from the mounted system image.
+    fn execute_mmc_command(&mut self) {
+        let cmd = self.mmc_cmd & 0x3F; // Extract command index (6 bits)
+        let arg = self.mmc_arg; // Sector address
+
+        match cmd {
+            MMC_CMD_READ_SINGLE => {
+                // CMD17: Read single block (512 bytes)
+                self.load_mmc_sector(arg, false);
+            }
+            MMC_CMD_READ_MULTIPLE => {
+                // CMD18: Read multiple — load first sector; guest may advance ARG and re-issue
+                // or call again with next LBA. We keep the sector buffer filled for sequential use.
+                self.load_mmc_sector(arg, true);
+            }
+            MMC_CMD_SEND_STATUS => {
+                // CMD13: Send status - return card status
+                self.mmc_resp = if self.mmc_card_data.is_some() { 0x00000001 } else { 0x00000000 };
+            }
+            MMC_CMD_APP_CMD => {
+                // CMD55: Application command prefix - acknowledge
+                self.mmc_resp = 0;
+            }
+            _ => {
+                // Unknown command - return error
+                self.mmc_resp = 0x80000000; // Error flag
+            }
+        }
+    }
+
+    fn load_mmc_sector(&mut self, arg: u32, _multi: bool) {
+        self.mmc_current_sector = arg;
+        self.mmc_buffer_offset = 0;
+        if let Some(ref card_data) = self.mmc_card_data {
+            let sector_offset = (arg as usize) * 512;
+            if sector_offset + 512 <= card_data.len() {
+                self.mmc_sector_buffer
+                    .copy_from_slice(&card_data[sector_offset..sector_offset + 512]);
+                self.mmc_resp = 0;
+            } else {
+                self.mmc_sector_buffer.fill(0);
+                self.mmc_resp = 0x80000000;
+            }
+        } else {
+            self.mmc_sector_buffer.fill(0);
+            self.mmc_resp = 0x80000000;
+        }
+    }
+
+    /// Executes a log write when the logger control register is triggered.
+    /// Reads tag and message strings from RAM and adds a LogEntry to the buffer.
+    fn execute_log_write(&mut self) {
+        // Read priority (lowest byte)
+        let priority = (self.log_prio & 0xFF) as u8;
+        
+        // Read tag string from RAM (tag_ptr)
+        let tag = self.read_string_from_ram(self.log_tag_ptr, 32);
+        
+        // Read message string from RAM (msg_ptr)
+        let message = self.read_string_from_ram(self.log_msg_ptr, 256);
+        
+        // Create log entry
+        let entry = LogEntry {
+            priority,
+            tag,
+            message,
+        };
+        
+        // Add to buffer, removing oldest if at capacity
+        if self.logger_buffer.len() >= self.logger_max_entries {
+            self.logger_buffer.remove(0);
+        }
+        self.logger_buffer.push(entry);
+    }
+
+    /// Reads a null-terminated string from RAM at the given address.
+    /// Returns at most max_len characters.
+    fn read_string_from_ram(&self, addr: u32, max_len: usize) -> String {
+        let mut result = String::with_capacity(max_len);
+        let mut offset = 0u32;
+        
+        while offset < max_len as u32 {
+            let byte = self.read_u8(addr.wrapping_add(offset));
+            if byte == 0 {
+                break;
+            }
+            result.push(byte as char);
+            offset += 1;
+        }
+        
+        result
+    }
+
+    // ── ASHMEM Command Execution ──────────────────────────────────────
+
+    /// Executes an ASHMEM command when the CMD register is written.
+    /// Handles CREATE, PIN, UNPIN, and PURGE operations.
+    fn execute_ashmem_command(&mut self) {
+        let cmd = self.ashmem_cmd;
+        let size = self.ashmem_size as usize;
+        let prot = self.ashmem_prot;
+
+        match cmd {
+            ASHMEM_CMD_CREATE => {
+                // Create a new shared memory region
+                let id = self.ashmem_regions.len() as u32;
+                let region = SharedMemoryRegion {
+                    id,
+                    size,
+                    data: vec![0u8; size],
+                    prot_mask: prot,
+                    pinned: false,
+                    mapped_addr: None,
+                };
+                self.ashmem_regions.push(region);
+                // Return region info via registers
+                self.ashmem_data_ptr = id; // Use ID as data pointer for now
+                self.ashmem_status = 0x1; // Initialized flag set
+            }
+            ASHMEM_CMD_PIN => {
+                // Pin a region (mark as locked/unswappable)
+                let region_id = self.ashmem_data_ptr as usize;
+                if region_id < self.ashmem_regions.len() {
+                    self.ashmem_regions[region_id].pinned = true;
+                    self.ashmem_pinned = 1;
+                }
+            }
+            ASHMEM_CMD_UNPIN => {
+                // Unpin a region
+                let region_id = self.ashmem_data_ptr as usize;
+                if region_id < self.ashmem_regions.len() {
+                    self.ashmem_regions[region_id].pinned = false;
+                    self.ashmem_pinned = 0;
+                }
+            }
+            ASHMEM_CMD_PURGE => {
+                // Purge all unpinned regions (free their data but keep metadata)
+                for region in &mut self.ashmem_regions {
+                    if !region.pinned {
+                        region.data.clear();
+                        region.data.shrink_to_fit();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ── Read operations (little-endian) ───────────────────────────────
 
     /// Reads a single byte from the given address.
@@ -284,6 +665,106 @@ impl Mmu {
 
     /// Reads a peripheral MMIO register as a 32-bit value.
     fn read_periph_u32(&self, addr: u32) -> u32 {
+        // Android-specific MMIO devices
+        if Self::is_android_periph(addr) {
+            // Goldfish GPU - framebuffer info registers
+            if addr >= GOLDFISH_FB_BASE && addr < GOLDFISH_FB_BASE + 0x100 {
+                return match addr - GOLDFISH_FB_BASE {
+                    0x00 => self.goldfish_fb_config.width,    // FB_WIDTH
+                    0x04 => self.goldfish_fb_config.height,   // FB_HEIGHT
+                    0x08 => self.goldfish_fb_config.format,   // FB_FORMAT
+                    0x0C => if self.goldfish_fb_config.enabled { 1 } else { 0 }, // FB_ENABLED
+                    0x10 => VRAM_BASE, // FB_ADDR (physical address of framebuffer)
+                    _ => 0,
+                };
+            }
+            // SD/MMC card interface - full command register set
+            if addr >= MMC_BASE && addr < MMC_BASE + MMC_SIZE {
+                let reg_offset = addr - MMC_BASE;
+                return match reg_offset {
+                    MMC_REG_CMD => self.mmc_cmd,
+                    MMC_REG_ARG => self.mmc_arg,
+                    MMC_REG_RESP => self.mmc_resp,
+                    MMC_REG_STATUS => {
+                        // Status: bit0=card present, bit1=ready, bit2=busy, bit3=data available
+                        let card_present = if self.mmc_card_data.is_some() { 1 } else { 0 };
+                        let ready = if self.mmc_card_data.is_some() { 1 } else { 0 };
+                        let data_avail = if self.mmc_buffer_offset < 512 { 1 } else { 0 };
+                        (card_present) | (ready << 1) | (data_avail << 3)
+                    }
+                    MMC_REG_DATA => {
+                        // Return next byte from sector buffer as 32-bit word
+                        if self.mmc_buffer_offset < 512 {
+                            let offset = self.mmc_buffer_offset;
+                            let b0 = self.mmc_sector_buffer[offset] as u32;
+                            let b1 = self.mmc_sector_buffer.get(offset + 1).copied().unwrap_or(0) as u32;
+                            let b2 = self.mmc_sector_buffer.get(offset + 2).copied().unwrap_or(0) as u32;
+                            let b3 = self.mmc_sector_buffer.get(offset + 3).copied().unwrap_or(0) as u32;
+                            b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                        } else {
+                            0
+                        }
+                    }
+                    MMC_REG_CTRL => 0, // Control register - stub
+                    _ => 0,
+                };
+            }
+            // Goldfish RTC
+            if addr >= GOLDFISH_RTC_BASE && addr < GOLDFISH_RTC_BASE + 0x1000 {
+                return match addr - GOLDFISH_RTC_BASE {
+                    0x00 => (self.goldfish_rtc & 0xFFFFFFFF) as u32, // Time low
+                    0x04 => (self.goldfish_rtc >> 32) as u32,        // Time high
+                    _ => 0,
+                };
+            }
+            // Binder IPC - return protocol version/status
+            if addr >= BINDER_BASE && addr < BINDER_BASE + 0x100 {
+                return match addr - BINDER_BASE {
+                    0x00 => 0x00000001, // BINDER_VERSION
+                    _ => 0,
+                };
+            }
+            // Goldfish Pipe - probe returns a simple status magic so kernels see a live device
+            if addr >= GOLDFISH_PIPE_BASE && addr < GOLDFISH_PIPE_BASE + GOLDFISH_PIPE_SIZE {
+                let off = addr - GOLDFISH_PIPE_BASE;
+                return match off {
+                    0x00 => 0x5049_5045, // 'PIPE' magic
+                    0x04 => 1,           // version
+                    _ => 0,
+                };
+            }
+            // Android Logger (logcat) interface
+            if addr >= ANDROID_LOG_BASE && addr < ANDROID_LOG_BASE + ANDROID_LOG_SIZE {
+                let reg_offset = addr - ANDROID_LOG_BASE;
+                return match reg_offset {
+                    LOG_REG_PRIO => self.log_prio,
+                    LOG_REG_TAG => self.log_tag_ptr,
+                    LOG_REG_MSG => self.log_msg_ptr,
+                    LOG_REG_CTRL => self.log_ctrl,
+                    LOG_REG_STATUS => {
+                        // bit0 = ready, bit1 = buffer full
+                        let ready = 1;
+                        let buffer_full = if self.logger_buffer.len() >= self.logger_max_entries { 1 } else { 0 };
+                        ready | (buffer_full << 1)
+                    }
+                    _ => 0,
+                };
+            }
+            // ASHMEM (Anonymous Shared Memory) interface
+            if addr >= ASHMEM_BASE && addr < ASHMEM_BASE + ASHMEM_SIZE {
+                let reg_offset = addr - ASHMEM_BASE;
+                return match reg_offset {
+                    ASHMEM_REG_CMD => self.ashmem_cmd,
+                    ASHMEM_REG_SIZE => self.ashmem_size,
+                    ASHMEM_REG_PROT => self.ashmem_prot,
+                    ASHMEM_REG_PINNED => self.ashmem_pinned,
+                    ASHMEM_REG_DATA_PTR => self.ashmem_data_ptr,
+                    ASHMEM_REG_STATUS => self.ashmem_status,
+                    _ => 0,
+                };
+            }
+        }
+
         if Self::is_vpb_periph(addr) {
             if addr >= VPB_VIC_BASE && addr < VPB_VIC_BASE + 0x1000 {
                 return match addr - VPB_VIC_BASE {
@@ -455,6 +936,78 @@ impl Mmu {
             }
             if addr == AUDIO_FREQ {
                 self.audio_freq = val;
+                return;
+            }
+            // Android-specific device writes
+            if Self::is_android_periph(addr) {
+                // Goldfish GPU - enable/disable framebuffer
+                if addr >= GOLDFISH_FB_BASE && addr < GOLDFISH_FB_BASE + 0x100 {
+                    match addr - GOLDFISH_FB_BASE {
+                        0x0C => self.goldfish_fb_config.enabled = val != 0,
+                        0x14 => self.goldfish_fb_config.width = val,
+                        0x18 => self.goldfish_fb_config.height = val,
+                        _ => {}
+                    }
+                }
+                // SD/MMC - full command interface
+                if addr >= MMC_BASE && addr < MMC_BASE + MMC_SIZE {
+                    let reg_offset = addr - MMC_BASE;
+                    match reg_offset {
+                        MMC_REG_CMD => {
+                            self.mmc_cmd = val;
+                            self.execute_mmc_command();
+                        }
+                        MMC_REG_ARG => self.mmc_arg = val,
+                        MMC_REG_CTRL => { /* Control register - no operation */ }
+                        _ => {}
+                    }
+                }
+                // Goldfish RTC - update time
+                if addr >= GOLDFISH_RTC_BASE && addr < GOLDFISH_RTC_BASE + 0x1000 {
+                    match addr - GOLDFISH_RTC_BASE {
+                        0x00 => self.goldfish_rtc = (self.goldfish_rtc & 0xFFFFFFFF_00000000) | (val as u64),
+                        0x04 => self.goldfish_rtc = (self.goldfish_rtc & 0x00000000_FFFFFFFF) | ((val as u64) << 32),
+                        _ => {}
+                    }
+                }
+                // Android Logger (logcat) - write log entry
+                if addr >= ANDROID_LOG_BASE && addr < ANDROID_LOG_BASE + ANDROID_LOG_SIZE {
+                    let reg_offset = addr - ANDROID_LOG_BASE;
+                    match reg_offset {
+                        LOG_REG_PRIO => self.log_prio = val,
+                        LOG_REG_TAG => self.log_tag_ptr = val,
+                        LOG_REG_MSG => self.log_msg_ptr = val,
+                        LOG_REG_CTRL => {
+                            self.log_ctrl = val;
+                            // Trigger log write on bit 0 set
+                            if val & 0x1 != 0 {
+                                self.execute_log_write();
+                                // Clear trigger bit after execution
+                                self.log_ctrl &= !0x1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // ASHMEM (Anonymous Shared Memory) - create/manage shared regions
+                if addr >= ASHMEM_BASE && addr < ASHMEM_BASE + ASHMEM_SIZE {
+                    let reg_offset = addr - ASHMEM_BASE;
+                    match reg_offset {
+                        ASHMEM_REG_CMD => {
+                            self.ashmem_cmd = val;
+                            self.execute_ashmem_command();
+                        }
+                        ASHMEM_REG_SIZE => self.ashmem_size = val,
+                        ASHMEM_REG_PROT => self.ashmem_prot = val,
+                        ASHMEM_REG_PINNED => self.ashmem_pinned = val,
+                        ASHMEM_REG_DATA_PTR => self.ashmem_data_ptr = val,
+                        _ => {}
+                    }
+                }
+                // Binder IPC - increment transaction counter
+                if addr >= BINDER_BASE && addr < BINDER_BASE + BINDER_SIZE {
+                    self.binder_seq = self.binder_seq.wrapping_add(1);
+                }
                 return;
             }
             return;

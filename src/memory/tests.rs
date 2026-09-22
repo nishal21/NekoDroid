@@ -282,3 +282,316 @@
         assert_eq!(mmu.audio_ctrl, 0);
         assert_eq!(mmu.read_u32(0x1000_0018), 0);
     }
+
+    // ── Android MMIO Devices ──────────────────────────────────────────
+
+    #[test]
+    fn test_goldfish_gpu_framebuffer_registers() {
+        let mut mmu = Mmu::new(256);
+
+        // Default framebuffer config
+        assert_eq!(mmu.read_u32(0x1F00_0000), 800);  // FB_WIDTH
+        assert_eq!(mmu.read_u32(0x1F00_0004), 600);  // FB_HEIGHT
+        assert_eq!(mmu.read_u32(0x1F00_0008), 0);    // FB_FORMAT (RGBA8888)
+        assert_eq!(mmu.read_u32(0x1F00_000C), 0);    // FB_ENABLED (false)
+        assert_eq!(mmu.read_u32(0x1F00_0010), 0x0400_0000); // FB_ADDR (VRAM_BASE)
+
+        // Enable framebuffer
+        mmu.write_u32(0x1F00_000C, 1);
+        assert!(mmu.goldfish_fb_config.enabled);
+        assert_eq!(mmu.read_u32(0x1F00_000C), 1);
+
+        // Change resolution
+        mmu.write_u32(0x1F00_0014, 1280); // Set width
+        mmu.write_u32(0x1F00_0018, 720);  // Set height
+        assert_eq!(mmu.goldfish_fb_config.width, 1280);
+        assert_eq!(mmu.goldfish_fb_config.height, 720);
+    }
+
+    #[test]
+    fn test_mmc_card_status() {
+        let mut mmu = Mmu::new(256);
+
+        // No card mounted - status should indicate no card (bit0=0, bit1=0)
+        // Status register is at offset 0x0C
+        assert_eq!(mmu.read_u32(0x1C00_000C) & 0x3, 0);
+
+        // Mount a system image (simulate) - at least 2 sectors (1024 bytes)
+        mmu.mmc_card_data = Some(vec![0u8; 1024]);
+
+        // Card present and ready - status should be 0x3 (bit0=1 present, bit1=1 ready)
+        assert_eq!(mmu.read_u32(0x1C00_000C) & 0x3, 0x3);
+    }
+
+    #[test]
+    fn test_mmc_sector_read() {
+        let mut mmu = Mmu::new(256);
+        
+        // Create test system image with pattern in first sector
+        let mut test_image = vec![0u8; 1024];
+        for i in 0..512 {
+            test_image[i] = (i % 256) as u8;
+        }
+        mmu.mmc_card_data = Some(test_image);
+        
+        // Issue CMD17 (READ_SINGLE) to read sector 0
+        mmu.write_u32(0x1C00_0004, 0); // Set argument (sector 0)
+        mmu.write_u32(0x1C00_0000, 17); // Issue CMD17
+        
+        // Check response is success (0)
+        assert_eq!(mmu.mmc_resp, 0);
+        
+        // Read data from data register - should get first 4 bytes
+        let data = mmu.read_u32(0x1C00_0010);
+        assert_eq!(data & 0xFF, 0); // First byte
+        assert_eq!((data >> 8) & 0xFF, 1); // Second byte
+        assert_eq!((data >> 16) & 0xFF, 2); // Third byte
+        assert_eq!((data >> 24) & 0xFF, 3); // Fourth byte
+    }
+
+    #[test]
+    fn test_mmc_cmd18_read_multiple_first_sector() {
+        let mut mmu = Mmu::new(256);
+        let mut test_image = vec![0u8; 1024];
+        for i in 0..512 {
+            test_image[i] = 0xA0;
+        }
+        for i in 512..1024 {
+            test_image[i] = 0xB0;
+        }
+        mmu.mmc_card_data = Some(test_image);
+        mmu.write_u32(0x1C00_0004, 0);
+        mmu.write_u32(0x1C00_0000, 18); // CMD18
+        assert_eq!(mmu.mmc_resp, 0);
+        let data = mmu.read_u32(0x1C00_0010);
+        assert_eq!(data & 0xFF, 0xA0);
+        // Next LBA via ARG bump + CMD18 again
+        mmu.write_u32(0x1C00_0004, 1);
+        mmu.write_u32(0x1C00_0000, 18);
+        assert_eq!(mmu.mmc_resp, 0);
+        let data2 = mmu.read_u32(0x1C00_0010);
+        assert_eq!(data2 & 0xFF, 0xB0);
+    }
+
+    #[test]
+    fn test_mmc_read_beyond_end() {
+        let mut mmu = Mmu::new(256);
+        
+        // Small image - only 1 sector
+        mmu.mmc_card_data = Some(vec![0u8; 512]);
+        
+        // Try to read sector 10 (way beyond end)
+        mmu.write_u32(0x1C00_0004, 10); // Set argument (sector 10)
+        mmu.write_u32(0x1C00_0000, 17); // Issue CMD17
+        
+        // Should return error response
+        assert_eq!(mmu.mmc_resp, 0x80000000);
+    }
+
+    #[test]
+    fn test_goldfish_rtc() {
+        let mut mmu = Mmu::new(256);
+
+        // Default RTC is 0
+        assert_eq!(mmu.read_u32(0x1010_1000), 0); // Time low
+        assert_eq!(mmu.read_u32(0x1010_1004), 0); // Time high
+
+        // Set RTC time (64-bit)
+        mmu.write_u32(0x1010_1000, 0x12345678); // Time low
+        mmu.write_u32(0x1010_1004, 0x9ABCDEF0); // Time high
+
+        assert_eq!(mmu.read_u32(0x1010_1000), 0x12345678);
+        assert_eq!(mmu.read_u32(0x1010_1004), 0x9ABCDEF0);
+        assert_eq!(mmu.goldfish_rtc, 0x9ABCDEF0_12345678);
+    }
+
+    #[test]
+    fn test_binder_version() {
+        let mmu = Mmu::new(256);
+
+        // Binder protocol version should be 1 (at 0x0A00_0000)
+        assert_eq!(mmu.read_u32(0x0A00_0000), 0x00000001);
+    }
+
+    #[test]
+    fn test_binder_transaction_counter() {
+        let mut mmu = Mmu::new(256);
+
+        // Initial sequence is 0
+        assert_eq!(mmu.binder_seq, 0);
+
+        // Writing to Binder region increments sequence (at 0x0A00_0000)
+        mmu.write_u32(0x0A00_0004, 0);
+        assert_eq!(mmu.binder_seq, 1);
+
+        mmu.write_u32(0x0A00_0008, 0);
+        assert_eq!(mmu.binder_seq, 2);
+    }
+
+    #[test]
+    fn test_android_logger_registers() {
+        let mut mmu = Mmu::new(256);
+
+        // Write to logger registers
+        mmu.write_u32(0x1E00_0000, 4); // LOG_REG_PRIO = INFO (4)
+        mmu.write_u32(0x1E00_0004, 0x8000); // LOG_REG_TAG = pointer
+        mmu.write_u32(0x1E00_0008, 0x9000); // LOG_REG_MSG = pointer
+
+        // Verify writes
+        assert_eq!(mmu.read_u32(0x1E00_0000), 4);
+        assert_eq!(mmu.read_u32(0x1E00_0004), 0x8000);
+        assert_eq!(mmu.read_u32(0x1E00_0008), 0x9000);
+
+        // Check status - should be ready
+        let status = mmu.read_u32(0x1E00_0010); // LOG_REG_STATUS
+        assert_eq!(status & 0x1, 1); // bit0 = ready
+    }
+
+    #[test]
+    fn test_android_logger_write_entry() {
+        let mut mmu = Mmu::new(65536); // 64KB RAM for strings
+
+        // Store tag string at 0x8000
+        let tag_str = b"TestTag\0";
+        mmu.load_bytes(0x8000, tag_str);
+
+        // Store message string at 0x9000
+        let msg_str = b"Hello from Android!\0";
+        mmu.load_bytes(0x9000, msg_str);
+
+        // Set up logger registers
+        mmu.write_u32(0x1E00_0000, 4); // LOG_PRIO_INFO
+        mmu.write_u32(0x1E00_0004, 0x8000); // tag pointer
+        mmu.write_u32(0x1E00_0008, 0x9000); // message pointer
+
+        // Trigger log write (set bit 0 of control register)
+        assert_eq!(mmu.logger_buffer.len(), 0);
+        mmu.write_u32(0x1E00_000C, 0x1); // LOG_REG_CTRL - trigger
+
+        // Verify log entry was created
+        assert_eq!(mmu.logger_buffer.len(), 1);
+        let entry = &mmu.logger_buffer[0];
+        assert_eq!(entry.priority, 4); // INFO
+        assert_eq!(entry.tag, "TestTag");
+        assert_eq!(entry.message, "Hello from Android!");
+
+        // Control register should have trigger bit cleared
+        assert_eq!(mmu.log_ctrl & 0x1, 0);
+    }
+
+    #[test]
+    fn test_android_logger_buffer_full() {
+        // Need enough RAM to store strings at addresses 0x1000-0x3000
+        let mut mmu = Mmu::new(16384); // 16KB RAM
+
+        // Set small buffer capacity
+        mmu.logger_max_entries = 3;
+
+        // Add entries until full
+        for i in 0..5 {
+            let tag = format!("Tag{}\0", i);
+            let msg = format!("Message{}\0", i);
+            
+            // Store strings in RAM at different locations
+            let tag_addr = 0x1000 + (i * 32) as u32;
+            let msg_addr = 0x2000 + (i * 64) as u32;
+            mmu.load_bytes(tag_addr, tag.as_bytes());
+            mmu.load_bytes(msg_addr, msg.as_bytes());
+            
+            mmu.log_prio = 4;
+            mmu.log_tag_ptr = tag_addr;
+            mmu.log_msg_ptr = msg_addr;
+            mmu.execute_log_write();
+        }
+
+        // Buffer should only have 3 entries (the last 3)
+        assert_eq!(mmu.logger_buffer.len(), 3);
+        assert_eq!(mmu.logger_buffer[0].tag, "Tag2");
+        assert_eq!(mmu.logger_buffer[2].tag, "Tag4");
+    }
+
+    // ── ASHMEM (Anonymous Shared Memory) Tests ───────────────────────
+
+    #[test]
+    fn test_ashmem_create_region() {
+        let mut mmu = Mmu::new(256);
+
+        // Set size and trigger create
+        mmu.write_u32(0x1B00_0004, 4096); // ASHMEM_REG_SIZE = 4KB
+        mmu.write_u32(0x1B00_0000, 1);    // ASHMEM_CMD_CREATE
+
+        // Verify region created
+        assert_eq!(mmu.ashmem_regions.len(), 1);
+        assert_eq!(mmu.ashmem_regions[0].size, 4096);
+        assert_eq!(mmu.ashmem_regions[0].data.len(), 4096);
+        assert!(!mmu.ashmem_regions[0].pinned);
+
+        // Verify status updated
+        assert_eq!(mmu.ashmem_status, 0x1); // Initialized flag
+        assert_eq!(mmu.ashmem_data_ptr, 0); // Region ID 0
+    }
+
+    #[test]
+    fn test_ashmem_pin_unpin() {
+        let mut mmu = Mmu::new(256);
+
+        // Create a region
+        mmu.write_u32(0x1B00_0004, 1024);
+        mmu.write_u32(0x1B00_0000, 1); // CREATE
+
+        // Pin the region
+        mmu.write_u32(0x1B00_0010, 0); // Set data_ptr to region 0
+        mmu.write_u32(0x1B00_0000, 2); // ASHMEM_CMD_PIN
+
+        assert!(mmu.ashmem_regions[0].pinned);
+        assert_eq!(mmu.ashmem_pinned, 1);
+
+        // Unpin the region
+        mmu.write_u32(0x1B00_0000, 3); // ASHMEM_CMD_UNPIN
+
+        assert!(!mmu.ashmem_regions[0].pinned);
+        assert_eq!(mmu.ashmem_pinned, 0);
+    }
+
+    #[test]
+    fn test_ashmem_multiple_regions() {
+        let mut mmu = Mmu::new(256);
+
+        // Create multiple regions
+        for i in 0..3 {
+            let size = 1024 * (i + 1);
+            mmu.write_u32(0x1B00_0004, size);
+            mmu.write_u32(0x1B00_0000, 1); // CREATE
+            assert_eq!(mmu.ashmem_data_ptr, i as u32);
+        }
+
+        assert_eq!(mmu.ashmem_regions.len(), 3);
+        assert_eq!(mmu.ashmem_regions[0].size, 1024);
+        assert_eq!(mmu.ashmem_regions[1].size, 2048);
+        assert_eq!(mmu.ashmem_regions[2].size, 3072);
+    }
+
+    #[test]
+    fn test_ashmem_purge_unpinned() {
+        let mut mmu = Mmu::new(256);
+
+        // Create two regions
+        mmu.write_u32(0x1B00_0004, 1024);
+        mmu.write_u32(0x1B00_0000, 1); // CREATE region 0
+
+        mmu.write_u32(0x1B00_0004, 1024);
+        mmu.write_u32(0x1B00_0000, 1); // CREATE region 1
+
+        // Pin region 0
+        mmu.write_u32(0x1B00_0010, 0);
+        mmu.write_u32(0x1B00_0000, 2); // PIN region 0
+
+        // Purge all unpinned regions
+        mmu.write_u32(0x1B00_0000, 4); // PURGE
+
+        // Region 0 should still have data (pinned)
+        assert_eq!(mmu.ashmem_regions[0].data.len(), 1024);
+
+        // Region 1 should have been purged (unpinned)
+        assert!(mmu.ashmem_regions[1].data.is_empty());
+    }

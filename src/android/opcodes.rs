@@ -1,0 +1,35 @@
+//! Dalvik opcode constants (subset).
+
+pub const NOP: u8 = 0x00;
+pub const MOVE: u8 = 0x01;
+pub const MOVE_FROM16: u8 = 0x02;
+pub const MOVE_16: u8 = 0x03;
+pub const MOVE_OBJECT: u8 = 0x07;
+pub const MOVE_OBJECT_FROM16: u8 = 0x08;
+pub const MOVE_RESULT: u8 = 0x0a;
+pub const MOVE_RESULT_OBJECT: u8 = 0x0c;
+pub const RETURN_VOID: u8 = 0x0e;
+pub const RETURN: u8 = 0x0f;
+pub const RETURN_OBJECT: u8 = 0x11;
+pub const CONST_4: u8 = 0x12;
+pub const CONST_16: u8 = 0x13;
+pub const CONST: u8 = 0x14;
+pub const CONST_HIGH16: u8 = 0x15;
+pub const CONST_STRING: u8 = 0x1a;
+pub const CONST_STRING_JUMBO: u8 = 0x1b;
+pub const NEW_INSTANCE: u8 = 0x22;
+pub const GOTO: u8 = 0x28;
+pub const GOTO_16: u8 = 0x29;
+pub const IF_EQZ: u8 = 0x38;
+pub const IF_NEZ: u8 = 0x39;
+pub const IF_EQ: u8 = 0x32;
+pub const IF_NE: u8 = 0x33;
+pub const IGET_OBJECT: u8 = 0x54;
+pub const IPUT_OBJECT: u8 = 0x5b;
+pub const SGET_OBJECT: u8 = 0x62;
+pub const SPUT_OBJECT: u8 = 0x69;
+pub const INVOKE_VIRTUAL: u8 = 0x6e;
+pub const INVOKE_SUPER: u8 = 0x6f;
+pub const INVOKE_DIRECT: u8 = 0x70;
+pub const INVOKE_STATIC: u8 = 0x71;
+pub const INVOKE_INTERFACE: u8 = 0x72;

@@ -9,8 +9,10 @@ pub struct Cp15 {
 impl Cp15 {
     pub fn new() -> Self {
         Self {
-            c0_midr: 0x410F_C080,
-            c1_sctlr: 0x0000_0000,
+            // ARM926EJ-S MIDR base value (variant/revision-neutral for procinfo matching)
+            c0_midr: 0x4106_9265,
+            // ARM926 reset-style control register value used by Linux early boot checks.
+            c1_sctlr: 0x0000_0C12,
             c2_ttbr0: 0,
             c3_dacr: 0,
         }
@@ -22,6 +24,8 @@ impl Cp15 {
             (1, 0, 0, 0) => self.c1_sctlr,
             (2, 0, 0, 0) => self.c2_ttbr0,
             (3, 0, 0, 0) => self.c3_dacr,
+            // CP15 c7/c8 maintenance/status reads are modeled as benign zero.
+            (7, _, _, _) | (8, _, _, _) => 0,
             _ => {
                 crate::log(&format!(
                     "⚠️ Unimplemented CP15 read: CRn={}, CRm={}, opc1={}, opc2={}",
@@ -37,6 +41,9 @@ impl Cp15 {
             (1, 0, 0, 0) => self.c1_sctlr = val,
             (2, 0, 0, 0) => self.c2_ttbr0 = val,
             (3, 0, 0, 0) => self.c3_dacr = val,
+            // CP15 c7/c8 maintenance operations (cache/TLB/BTB) are no-ops in this model.
+            // Linux uses these during MMU enable/transition; treat them as supported.
+            (7, _, _, _) | (8, _, _, _) => {}
             _ => crate::log(&format!(
                 "⚠️ Unimplemented CP15 write: CRn={}, CRm={}, opc1={}, opc2={}, val={:#010X}",
                 crn, crm, opc1, opc2, val

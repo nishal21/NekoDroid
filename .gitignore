@@ -7,25 +7,52 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# Deps / build output
+node_modules/
+dist/
+dist-ssr/
 *.local
-project_REFERENCE.md
+/target/
+/pkg/
+pkg-*/
 
-# Editor directories and files
+# Editor / local agent
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
+.cursor/
 .DS_Store
+Thumbs.db
+Desktop.ini
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+.env
+.env.*
 
+# Local handoff only (not published). Do not list DEVLOG.md here —
+# Windows gitignore is case-insensitive and would hide the tracked DEVLOG.md.
+learning-journal.md
+handoff-devlog.md
 
-# Added by cargo
+# Nested working copy (sync into root; never publish this folder)
+/browser-droid/
 
-/target
-/pkg
+# Large local kernel/system images
+/test-images/
+*.zImage
+*.cpio.gz
+*.img
+*.qcow2
+*.raw
+
+# Misc junk that should never land on GitHub
+*.tmp
+*.bak
+*.orig
+*~
+.cache/
+coverage/
+.wasm-pack/

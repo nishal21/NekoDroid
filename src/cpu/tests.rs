@@ -60,6 +60,21 @@
     }
 
     #[test]
+    fn test_pc_write_alignment_by_state() {
+        let mut rf = RegisterFile::new();
+
+        // ARM state PC writes are word-aligned.
+        rf.set_thumb(false);
+        rf.write(REG_PC, 0x10049);
+        assert_eq!(rf.pc(), 0x10048);
+
+        // Thumb state PC writes are halfword-aligned.
+        rf.set_thumb(true);
+        rf.write(REG_PC, 0x20003);
+        assert_eq!(rf.pc(), 0x20002);
+    }
+
+    #[test]
     fn test_update_nz() {
         let mut rf = RegisterFile::new();
         rf.update_nz(0);
@@ -182,6 +197,171 @@
         cpu.step(); // CMP
         assert!(cpu.regs.flag_z(), "Z flag should be set (5 - 5 = 0)");
         assert!(!cpu.regs.flag_n(), "N flag should be clear");
+    }
+
+    #[test]
+    fn test_arm_tst_sets_flags() {
+        // MOV R0, #0xF0  → E3A000F0
+        // MOV R1, #0x0F  → E3A0100F
+        // TST R0, R1     → E1100001
+        let program: Vec<u8> = [
+            0xE3A000F0u32.to_le_bytes(),
+            0xE3A0100Fu32.to_le_bytes(),
+            0xE1100001u32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert!(cpu.regs.flag_z(), "TST 0xF0 & 0x0F should set Z");
+        assert_eq!(cpu.regs.read(0), 0xF0, "TST must not modify R0");
+        assert_eq!(cpu.regs.read(1), 0x0F, "TST must not modify R1");
+    }
+
+    #[test]
+    fn test_arm_teq_sets_flags() {
+        // MOV R0, #0xAA  → E3A000AA
+        // MOV R1, #0xAA  → E3A010AA
+        // TEQ R0, R1     → E1300001
+        let program: Vec<u8> = [
+            0xE3A000AAu32.to_le_bytes(),
+            0xE3A010AAu32.to_le_bytes(),
+            0xE1300001u32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert!(cpu.regs.flag_z(), "TEQ equal operands should set Z");
+        assert!(!cpu.regs.flag_n(), "TEQ equal operands should clear N");
+        assert_eq!(cpu.regs.read(0), 0xAA, "TEQ must not modify R0");
+        assert_eq!(cpu.regs.read(1), 0xAA, "TEQ must not modify R1");
+    }
+
+    #[test]
+    fn test_arm_cmn_sets_flags() {
+        // MOV R0, #1     → E3A00001
+        // CMN R0, #0xFF  → E37000FF  (1 + 255 = 256)
+        let program: Vec<u8> = [
+            0xE3A00001u32.to_le_bytes(),
+            0xE37000FFu32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+
+        assert!(!cpu.regs.flag_z(), "CMN 1 + 255 should not set Z");
+        assert!(!cpu.regs.flag_n(), "CMN 1 + 255 should keep N clear");
+        assert_eq!(cpu.regs.read(0), 1, "CMN must not modify R0");
+    }
+
+    #[test]
+    fn test_arm_register_shift_operand2_lsl_by_register() {
+        // MOV R0, #1        -> E3A00001
+        // MOV R1, #3        -> E3A01003
+        // MOV R2, R0, LSL R1 -> E1A02110
+        let program: Vec<u8> = [
+            0xE3A00001u32.to_le_bytes(),
+            0xE3A01003u32.to_le_bytes(),
+            0xE1A02110u32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert_eq!(cpu.regs.read(2), 8);
+    }
+
+    #[test]
+    fn test_arm_immediate_shift_special_cases() {
+        // MOV R0, #0x80         -> E3A00080
+        // MOV R1, R0, LSR #0    -> E1A01020  (means LSR #32 => 0)
+        // MOV R2, R0, ASR #0    -> E1A02040  (means ASR #32 => 0)
+        let program: Vec<u8> = [
+            0xE3A00080u32.to_le_bytes(),
+            0xE1A01020u32.to_le_bytes(),
+            0xE1A02040u32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert_eq!(cpu.regs.read(1), 0, "LSR #0 should behave as LSR #32");
+        assert_eq!(cpu.regs.read(2), 0, "ASR #0 on positive value should clear to 0");
+    }
+
+    #[test]
+    fn test_arm_movs_lsr_32_sets_carry_from_bit31() {
+        // MOV R0, #1           -> E3A00001
+        // MOV R0, R0, LSL #31  -> E1A00F80  (R0 = 0x80000000)
+        // MOVS R1, R0, LSR #0  -> E1B01020  (LSR #32 => result 0, C=old bit31)
+        let program: Vec<u8> = [
+            0xE3A00001u32.to_le_bytes(),
+            0xE1A00F80u32.to_le_bytes(),
+            0xE1B01020u32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert_eq!(cpu.regs.read(1), 0);
+        assert!(cpu.regs.flag_c(), "C should come from bit31 on LSR #32 form");
+        assert!(cpu.regs.flag_z(), "Result zero should set Z");
+    }
+
+    #[test]
+    fn test_arm_tst_updates_carry_from_shifter() {
+        // MOV R0, #1           -> E3A00001
+        // MVN R1, #0           -> E3E01000 (R1 = 0xFFFFFFFF)
+        // TST R1, R0, LSL #31  -> E1110F80  (operand2 bit31=1, carry_out from shift=0)
+        let program: Vec<u8> = [
+            0xE3A00001u32.to_le_bytes(),
+            0xE3E01000u32.to_le_bytes(),
+            0xE1110F80u32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.set_flag_c(true);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert!(cpu.regs.flag_n(), "Bit31 of AND result should set N");
+        assert!(!cpu.regs.flag_c(), "C should be updated from shifter carry-out");
+    }
+
+    #[test]
+    fn test_arm_clz() {
+        // MOV R0, #1            -> E3A00001
+        // CLZ R1, R0            -> E16F1F10 (31 leading zeros)
+        // MVN R2, #0            -> E3E02000 (0xFFFFFFFF)
+        // CLZ R3, R2            -> E16F3F12 (0 leading zeros)
+        let program: Vec<u8> = [
+            0xE3A00001u32.to_le_bytes(),
+            0xE16F1F10u32.to_le_bytes(),
+            0xE3E02000u32.to_le_bytes(),
+            0xE16F3F12u32.to_le_bytes(),
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert_eq!(cpu.regs.read(1), 31);
+        assert_eq!(cpu.regs.read(3), 0);
     }
 
     // ── Branch tests ──────────────────────────────────────────────────
@@ -735,6 +915,51 @@
         assert_eq!(cpu.regs.pc(), 0x10, "PC should return from exception");
     }
 
+    #[test]
+    fn test_semihosting_swi_write0_bypasses_exception() {
+        let program: Vec<u8> = [
+            0xE3A00004u32.to_le_bytes(), // MOV R0, #4 (SYS_WRITE0)
+            0xE3A01C02u32.to_le_bytes(), // MOV R1, #0x200
+            0xEF123456u32.to_le_bytes(), // SWI 0x123456 (semihosting)
+            0xE1A00000u32.to_le_bytes(), // NOP
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.mmu.write_u8(0x200, b'O');
+        cpu.mmu.write_u8(0x201, b'K');
+        cpu.mmu.write_u8(0x202, 0);
+
+        cpu.step(); // MOV R0
+        cpu.step(); // MOV R1
+
+        let cpsr_before = cpu.regs.cpsr();
+        cpu.step(); // semihosting SWI
+
+        assert_eq!(cpu.regs.cpu_mode(), 0x10, "Semihosting SWI should not switch to SVC mode");
+        assert_eq!(cpu.regs.cpsr(), cpsr_before, "Semihosting SWI should not alter CPSR");
+        assert_eq!(cpu.regs.pc(), 0x0C, "PC should continue to next instruction without vector jump");
+    }
+
+    #[test]
+    fn test_semihosting_swi_exit_halts_cpu() {
+        let program: Vec<u8> = [
+            0xE3A00017u32.to_le_bytes(), // MOV R0, #0x17 (SYS_EXIT)
+            0xE3A01001u32.to_le_bytes(), // MOV R1, #1 (exit reason)
+            0xEF123456u32.to_le_bytes(), // SWI 0x123456
+        ].concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+
+        assert!(!cpu.halted, "CPU should still be running before SYS_EXIT");
+        cpu.step();
+
+        assert!(cpu.halted, "SYS_EXIT should halt CPU");
+        assert_eq!(cpu.regs.cpu_mode(), 0x10, "Semihosting SYS_EXIT should not switch to SVC mode");
+        assert_eq!(cpu.regs.pc(), 0x0C, "PC should advance past SWI instruction");
+    }
+
     // ── BLX tests ────────────────────────────────────────────────────
 
     #[test]
@@ -1228,13 +1453,33 @@
         let mut cpu = cpu_with_program(&program);
 
         cpu.step();
-        assert_eq!(cpu.regs.read(0), 0x410F_C080);
+        assert_eq!(cpu.regs.read(0), 0x4106_9265);
 
         cpu.step();
         assert_eq!(cpu.regs.read(1), 0x1);
 
         cpu.step();
         assert_eq!(cpu.cp15.c1_sctlr, 0x1);
+    }
+
+    #[test]
+    fn test_mrs_msr_cpsr_control_fields() {
+        // MRS R2, CPSR        -> 0xE10F2000
+        // ORR R2, R2, #0xC0   -> 0xE38220C0
+        // MSR CPSR_c, R2      -> 0xE121F002
+        let program: Vec<u8> = [
+            0xE10F2000u32.to_le_bytes(),
+            0xE38220C0u32.to_le_bytes(),
+            0xE121F002u32.to_le_bytes(),
+        ]
+        .concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.step();
+        cpu.step();
+        cpu.step();
+
+        assert_eq!(cpu.regs.cpsr() & 0xC0, 0xC0, "MSR CPSR_c should set IRQ/FIQ mask bits");
     }
 
     #[test]
@@ -1286,14 +1531,54 @@
         let mut cpu = Cpu::new(16 * 1024 * 1024);
         let dummy_kernel = [0x00, 0x00, 0xA0, 0xE3]; // MOV R0, #0
 
-        cpu.boot_linux(&dummy_kernel, 0x0183);
+        cpu.boot_linux(&dummy_kernel, None, 0x0183);
 
         assert_eq!(cpu.regs.read(0), 0);
         assert_eq!(cpu.regs.read(1), 0x0183);
         assert_eq!(cpu.regs.read(2), 0x100);
-        assert_eq!(cpu.regs.pc(), 0x8000);
+        assert_eq!(cpu.regs.pc(), 0x0001_0000);
+        assert_eq!(cpu.regs.cpu_mode(), 0x13);
+        assert!(cpu.regs.irq_disabled());
+        assert!(!cpu.regs.is_thumb());
 
         assert_eq!(cpu.mmu.read_u32(0x100), 2);
         assert_eq!(cpu.mmu.read_u32(0x10C), 0x5441_0002);
         assert_eq!(cpu.mmu.read_u32(0x110), 16 * 1024 * 1024);
+        assert_eq!(cpu.mmu.read_u32(0x118), 17); // ATAG_CMDLINE size words
+        assert_eq!(cpu.mmu.read_u32(0x11C), 0x5441_0009); // ATAG_CMDLINE tag
     }
+
+    #[test]
+    fn test_boot_linux_atag_initrd2() {
+        let mut cpu = Cpu::new(16 * 1024 * 1024);
+        let dummy_kernel = [0x00, 0x00, 0xA0, 0xE3]; // MOV R0, #0
+        let initrd = [0x11, 0x22, 0x33, 0x44];
+
+        cpu.boot_linux(&dummy_kernel, Some(&initrd), 0x0183);
+
+        assert_eq!(cpu.mmu.read_u32(0x118), 4); // ATAG_INITRD2 size words
+        assert_eq!(cpu.mmu.read_u32(0x11C), 0x5442_0005); // ATAG_INITRD2 tag
+        assert_eq!(cpu.mmu.read_u32(0x120), 0x0080_0000); // initrd base
+        assert_eq!(cpu.mmu.read_u32(0x124), 4); // initrd size
+        assert_eq!(cpu.mmu.read_u32(0x0080_0000), 0x4433_2211); // initrd copied to RAM
+        assert_eq!(cpu.mmu.read_u32(0x128), 17); // ATAG_CMDLINE follows INITRD2
+        assert_eq!(cpu.mmu.read_u32(0x12C), 0x5441_0009);
+    }
+
+    #[test]
+    fn test_fetch_fault_does_not_skip_abort_vector_entry() {
+        let mut cpu = Cpu::new(16 * 1024 * 1024);
+
+        // Enable MMU with an empty translation table to force a translation fault on fetch.
+        cpu.cp15.c1_sctlr = 1;
+        cpu.cp15.c2_ttbr0 = 0x0002_0000;
+
+        cpu.regs.set_pc(0x8000_0000);
+
+        // One step should take a Data Abort and land exactly on vector 0x10,
+        // not 0x14 (which would indicate PC was incorrectly advanced post-fault).
+        assert!(cpu.step());
+        assert_eq!(cpu.regs.pc(), 0x0000_0010);
+        assert_eq!(cpu.regs.cpu_mode(), 0x17); // Abort mode
+    }
+
