@@ -852,6 +852,15 @@ impl Cpu {
                 let rn = (instr >> 16) & 0xF;
                 let rd = (instr >> 12) & 0xF;
 
+                // MOVW / MOVT (ARMv7): TST/CMP immediate with S=0
+                if is_imm && s.is_empty() && (opcode == 0x8 || opcode == 0xA) {
+                    let imm4 = (instr >> 16) & 0xF;
+                    let imm12 = instr & 0xFFF;
+                    let imm16 = (imm4 << 12) | imm12;
+                    let mnemonic = if opcode == 0x8 { "MOVW" } else { "MOVT" };
+                    return format!("{}{} {}, #0x{:X}", mnemonic, cs, Self::reg_name(rd), imm16);
+                }
+
                 let op2_str = if is_imm {
                     let imm8 = instr & 0xFF;
                     let rotate = ((instr >> 8) & 0xF) * 2;
@@ -1476,6 +1485,29 @@ impl Cpu {
         let set_flags = (instr >> 20) & 1 == 1;
         let rn = ((instr >> 16) & 0xF) as usize;
         let rd = ((instr >> 12) & 0xF) as usize;
+
+        // ARMv7: TST/CMP with S=0 and immediate are MOVW/MOVT (16-bit immediate moves).
+        // Goldfish zImage uses `movw r0, #sizeof(inflate_state)` before malloc(workspace);
+        // without this, r0 keeps the prior pointer and malloc OOMs.
+        if is_imm && !set_flags {
+            let imm4 = (instr >> 16) & 0xF;
+            let imm12 = instr & 0xFFF;
+            let imm16 = (imm4 << 12) | imm12;
+            match opcode {
+                0x8 => {
+                    // MOVW Rd, #imm16 — zero-extend into Rd
+                    self.regs.write(rd, imm16);
+                    return;
+                }
+                0xA => {
+                    // MOVT Rd, #imm16 — write top half, keep bottom
+                    let low = self.regs.read(rd) & 0xFFFF;
+                    self.regs.write(rd, (imm16 << 16) | low);
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         // Compute operand2
         let (op2, shifter_carry) = if is_imm {

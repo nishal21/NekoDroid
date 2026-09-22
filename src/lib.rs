@@ -1025,4 +1025,35 @@ mod tests {
             eprintln!("  mem[{a:#x}] = {w:#010x}  {d}");
         }
     }
+
+    /// Session 60: MOVW/MOVT fix — workspace malloc must succeed (no OOM).
+    #[test]
+    fn test_optional_goldfish_oom_diag() {
+        let path = std::path::Path::new("test-images/zImage");
+        if !path.exists() {
+            return;
+        }
+        let kernel = std::fs::read(path).expect("read zImage");
+        ARM_CPU.with(|cell| {
+            *cell.borrow_mut() = Some(cpu::Cpu::new(256 * 1024 * 1024));
+        });
+        assert!(boot_linux_kernel(&kernel, &[]));
+
+        for _ in 0..20u32 {
+            let _ = run_batch(200_000, 50_000);
+            let lines = ARM_CPU.with(|cell| {
+                cell.borrow().as_ref().unwrap().mmu.uart_lines.clone()
+            });
+            if lines.iter().any(|l| l.contains("Out of memory")) {
+                panic!("workspace OOM still present after MOVW fix: {lines:?}");
+            }
+            if lines.iter().any(|l| l.contains("Uncompressing")) {
+                // Allow later inflate errors; OOM gate is what this session fixed.
+                eprintln!("goldfish past workspace alloc: {lines:?}");
+                return;
+            }
+        }
+        panic!("no Uncompressing uart within budget");
+    }
 }
+

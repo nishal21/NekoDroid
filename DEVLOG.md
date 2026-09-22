@@ -2060,3 +2060,25 @@ char* msg = "Application started";
 - Fix zImage decompress workspace OOM (malloc arena / free_mem_end)
 - Then continue toward full kernel init + more console output
 
+---
+
+## Session 60 — MOVW/MOVT fix (workspace OOM gone)
+
+### Cause
+- `movw r0, #0x252C` (sizeof inflate_state) was decoded as TST with S=0
+- r0 kept the prior `malloc` return pointer (`0x6f9450`)
+- next `malloc(r0)` requested ~7MB → `Out of memory while allocating workspace`
+
+### Fix
+- Implement ARMv7 MOVW/MOVT (imm TST/CMP with S=0)
+- Unit test `test_movw_movt`; goldfish OOM diag asserts no workspace OOM
+
+### Result
+- UART: `Uncompressing Linux...` then `decompressor returned an error` (inflate next)
+- No more workspace OOM; `cargo test --lib --release` → 133 passed
+
+### Next
+- Debug why gunzip/inflate returns error (0 bytes written at 0x8000)
+- Then pursue `done, booting the kernel` / earlyprintk past decompress
+
+

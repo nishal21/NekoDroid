@@ -167,6 +167,28 @@
     }
 
     #[test]
+    fn test_movw_movt() {
+        // MOVW R0, #0x252C → E302052C (goldfish inflate_state size pattern)
+        // MOVT R0, #0x1234 → E3410234 → R0 becomes 0x1234252C
+        let program: Vec<u8> = [
+            0xE302052Cu32.to_le_bytes(),
+            0xE3410234u32.to_le_bytes(),
+        ]
+        .concat();
+
+        let mut cpu = cpu_with_program(&program);
+        cpu.regs.write(0, 0xDEAD_BEEF);
+        cpu.step();
+        assert_eq!(cpu.regs.read(0), 0x252C, "MOVW zero-extends imm16");
+        cpu.step();
+        assert_eq!(cpu.regs.read(0), 0x1234_252C, "MOVT writes top half");
+        assert_eq!(
+            crate::cpu::Cpu::disassemble_instruction(0xE302_052C),
+            "MOVW R0, #0x252C"
+        );
+    }
+
+    #[test]
     fn test_sub_instruction() {
         // MOV R0, #20  → E3A00014
         // SUB R1, R0, #5 → E2401005
