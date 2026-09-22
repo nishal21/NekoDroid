@@ -830,7 +830,7 @@ mod tests {
         let kernel = std::fs::read(path).expect("read zImage");
         assert!(kernel.len() > 1024, "zImage too small");
         ARM_CPU.with(|cell| {
-            *cell.borrow_mut() = Some(cpu::Cpu::new(64 * 1024 * 1024));
+            *cell.borrow_mut() = Some(cpu::Cpu::new(256 * 1024 * 1024));
         });
         let initrd = std::fs::read("test-images/initrd.cpio.gz").unwrap_or_default();
         assert!(boot_linux_kernel(&kernel, &initrd));
@@ -847,7 +847,7 @@ mod tests {
         }
         let kernel = std::fs::read(path).expect("read zImage");
         ARM_CPU.with(|cell| {
-            *cell.borrow_mut() = Some(cpu::Cpu::new(64 * 1024 * 1024));
+            *cell.borrow_mut() = Some(cpu::Cpu::new(256 * 1024 * 1024));
         });
         assert!(boot_linux_kernel(&kernel, &[]));
 
@@ -901,20 +901,24 @@ mod tests {
                 )
             });
             eprintln!(
-                "goldfish uart long: more={more} pc={:#x} lines={} partial={:?} aborts={} first_abort_va={:#x} abort_sctlr={:#x} abort_ttbr={:#x} abort_pc={:#x} mmu_on_at={:?} sctlr_now={:#x} mode={:#x}",
+                "goldfish uart long: more={more} pc={:#x} lines={} sample={:?} aborts={} sctlr_now={:#x} mode={:#x}",
                 diag.0,
                 diag.1.len(),
-                diag.2.chars().take(120).collect::<String>(),
+                diag.1.iter().take(4).cloned().collect::<Vec<_>>(),
                 diag.3,
-                diag.4,
-                diag.5,
-                diag.6,
-                diag.7,
-                diag.8,
                 diag.9,
                 diag.10,
             );
-            let _ = diag.1;
+            // With Goldfish TTY + MRC-to-PC fix we should at least see decompress start.
+            assert!(
+                !diag.1.is_empty(),
+                "expected earlyprintk UART lines after long goldfish run"
+            );
+            assert!(
+                diag.1.iter().any(|l| l.contains("Uncompressing") || l.contains("Linux")),
+                "unexpected uart lines: {:?}",
+                diag.1
+            );
         }
     }
 
@@ -927,7 +931,7 @@ mod tests {
         }
         let kernel = std::fs::read(path).expect("read zImage");
         ARM_CPU.with(|cell| {
-            *cell.borrow_mut() = Some(cpu::Cpu::new(64 * 1024 * 1024));
+            *cell.borrow_mut() = Some(cpu::Cpu::new(256 * 1024 * 1024));
         });
         assert!(boot_linux_kernel(&kernel, &[]));
 
@@ -968,7 +972,7 @@ mod tests {
             }
             let _ = (mmu_pc, sctlr);
         }
-        let (aborts, pc, sctlr, mmu_pc, lines) = ARM_CPU.with(|cell| {
+        let (aborts, pc, sctlr, mmu_pc, lines, low) = ARM_CPU.with(|cell| {
             let b = cell.borrow();
             let c = b.as_ref().unwrap();
             (
@@ -977,11 +981,48 @@ mod tests {
                 c.cp15.c1_sctlr,
                 c.mmu_enable_pc,
                 c.mmu.uart_lines.len(),
+                (
+                    c.low_pc_from,
+                    c.low_pc_lr,
+                    c.low_pc_r0,
+                    c.low_pc_instr,
+                    c.low_pc_cpsr,
+                ),
             )
         });
         eprintln!(
             "no abort in budget: pc={:#x} sctlr={:#x} aborts={} mmu_enable_pc={:?} first_low={:?} uart_lines={}",
             pc, sctlr, aborts, mmu_pc, first_low, lines
         );
+        let uart_dump = ARM_CPU.with(|cell| {
+            cell.borrow().as_ref().unwrap().mmu.uart_lines.clone()
+        });
+        for (i, line) in uart_dump.iter().enumerate() {
+            eprintln!("  uart[{i}]: {line}");
+        }
+        eprintln!(
+            "low_pc_jump: from={:?} lr={:#x} r0={:#x} instr={:#010x} cpsr={:#x} disasm={}",
+            low.0,
+            low.1,
+            low.2,
+            low.3,
+            low.4,
+            cpu::Cpu::disassemble_instruction(low.3)
+        );
+        // Dump a few words around final PC to see spin loops
+        let words = ARM_CPU.with(|cell| {
+            let b = cell.borrow();
+            let c = b.as_ref().unwrap();
+            let base = c.regs.pc().saturating_sub(8);
+            (0..8)
+                .map(|i| {
+                    let a = base + i * 4;
+                    (a, c.mmu.read_u32(a), cpu::Cpu::disassemble_instruction(c.mmu.read_u32(a)))
+                })
+                .collect::<Vec<_>>()
+        });
+        for (a, w, d) in words {
+            eprintln!("  mem[{a:#x}] = {w:#010x}  {d}");
+        }
     }
 }

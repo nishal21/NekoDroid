@@ -403,6 +403,12 @@ pub struct Cpu {
     pub last_abort_ttbr0: u32,
     pub last_abort_pc: u32,
     pub mmu_enable_pc: Option<u32>,
+    /// When PC first jumps into low memory (< 0x1000) from a high PC.
+    pub low_pc_from: Option<u32>,
+    pub low_pc_lr: u32,
+    pub low_pc_r0: u32,
+    pub low_pc_instr: u32,
+    pub low_pc_cpsr: u32,
 }
 
 impl Cpu {
@@ -421,6 +427,11 @@ impl Cpu {
             last_abort_ttbr0: 0,
             last_abort_pc: 0,
             mmu_enable_pc: None,
+            low_pc_from: None,
+            low_pc_lr: 0,
+            low_pc_r0: 0,
+            low_pc_instr: 0,
+            low_pc_cpsr: 0,
         }
     }
 
@@ -439,6 +450,11 @@ impl Cpu {
             last_abort_ttbr0: 0,
             last_abort_pc: 0,
             mmu_enable_pc: None,
+            low_pc_from: None,
+            low_pc_lr: 0,
+            low_pc_r0: 0,
+            low_pc_instr: 0,
+            low_pc_cpsr: 0,
         }
     }
 
@@ -456,6 +472,11 @@ impl Cpu {
         self.last_abort_ttbr0 = 0;
         self.last_abort_pc = 0;
         self.mmu_enable_pc = None;
+        self.low_pc_from = None;
+        self.low_pc_lr = 0;
+        self.low_pc_r0 = 0;
+        self.low_pc_instr = 0;
+        self.low_pc_cpsr = 0;
         // Clear UART output buffer
         self.mmu.clear_uart_buffer();
         // Clear VRAM to black
@@ -1101,6 +1122,7 @@ impl Cpu {
             self.regs.pipeline_offset = 2; // advance_pc added 2, so +2 more = +4 from fetch
             self.execute_thumb_instruction(instr as u16, pc_at_fetch);
             self.regs.pipeline_offset = 0;
+            self.note_low_pc_jump(pc_at_fetch, instr);
             self.tick_sp804_timer();
             return true;
         }
@@ -1130,10 +1152,28 @@ impl Cpu {
             // Accept p15 and p10 encodings used by some toolchains/fixtures for CP15 ops.
             if coproc == 15 || coproc == 10 {
                 if is_mrc {
-                    let val = self.cp15.read_register(crn, crm, opc1, opc2);
-                    self.regs.write(rd, val);
+                    let mut val = self.cp15.read_register(crn, crm, opc1, opc2);
+                    if rd == 15 {
+                        // ARMv5: MRC to R15 writes result[31:28] into CPSR NZCV,
+                        // and does not change the PC.
+                        // Goldfish zImage uses `mrc p15,0,pc,c7,c14,3` + `bne`
+                        // as a completion wait — ensure Z is set so the loop exits.
+                        if crn == 7 {
+                            val |= 0x4000_0000;
+                        }
+                        let mut cpsr = self.regs.cpsr();
+                        cpsr = (cpsr & !0xF000_0000) | (val & 0xF000_0000);
+                        self.regs.set_cpsr(cpsr);
+                    } else {
+                        self.regs.write(rd, val);
+                    }
                 } else {
-                    let val = self.regs.read(rd);
+                    let val = if rd == 15 {
+                        // MCR from R15: read PC+offset (pipeline); treat as PC value
+                        self.regs.read(15)
+                    } else {
+                        self.regs.read(rd)
+                    };
                     let prev_m = self.cp15.c1_sctlr & 1;
                     self.cp15.write_register(crn, crm, opc1, opc2, val);
                     if crn == 1 && crm == 0 && opc1 == 0 && opc2 == 0 {
@@ -1154,11 +1194,31 @@ impl Cpu {
             }
 
             self.regs.pipeline_offset = 0;
+            self.note_low_pc_jump(pc_at_fetch, instr);
             self.tick_sp804_timer();
             return true;
         }
 
         // ── DECODE & EXECUTE ──────────────────────────────────────────
+        self.decode_and_execute(instr, pc_at_fetch);
+        self.regs.pipeline_offset = 0;
+        self.note_low_pc_jump(pc_at_fetch, instr);
+        self.tick_sp804_timer();
+        return true;
+    }
+
+    fn note_low_pc_jump(&mut self, from_pc: u32, instr: u32) {
+        let pc = self.regs.pc();
+        if self.low_pc_from.is_none() && from_pc >= 0x8000 && pc < 0x1000 {
+            self.low_pc_from = Some(from_pc);
+            self.low_pc_lr = self.regs.lr();
+            self.low_pc_r0 = self.regs.read(0);
+            self.low_pc_instr = instr;
+            self.low_pc_cpsr = self.regs.cpsr();
+        }
+    }
+
+    fn decode_and_execute(&mut self, instr: u32, pc_at_fetch: u32) {
         // Top-level decode using bits [27:25]
         let bits_27_25 = (instr >> 25) & 0b111;
 
@@ -1235,11 +1295,6 @@ impl Cpu {
             }
             _ => unreachable!(),
         }
-
-        self.regs.pipeline_offset = 0;
-        self.tick_sp804_timer();
-
-        true
     }
 
     // ── Condition code evaluation ─────────────────────────────────────

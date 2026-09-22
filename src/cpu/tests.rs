@@ -1483,6 +1483,23 @@
     }
 
     #[test]
+    fn test_mrc_to_pc_updates_flags_not_pc() {
+        let mut cpu = Cpu::new(1024);
+        cpu.regs.set_pc(0x8000);
+        cpu.regs.set_cpsr(0x13); // SVC, flags clear
+        // MRC p15, 0, pc, c7, c14, 3  — encoding 0xee17ff7e (bit4=1, Rd=15)
+        // c7 read returns 0 → NZCV stay 0; PC must not become 0
+        let instr = 0xee17ff7e;
+        // Manually run the coproc path via step with the instruction in memory
+        cpu.mmu.write_u32(0x8000, instr);
+        cpu.mmu.write_u32(0x8004, 0xe1a00000); // NOP (mov r0,r0)
+        assert!(cpu.step());
+        assert_ne!(cpu.regs.pc(), 0, "MRC to R15 must not jump to 0");
+        assert!(cpu.regs.pc() == 0x8004 || cpu.regs.pc() == 0x8008);
+        assert!(cpu.low_pc_from.is_none());
+    }
+
+    #[test]
     fn test_mmu_section_translation() {
         let mut cpu = Cpu::new(2 * 1024 * 1024); // 2 MB RAM
 

@@ -2038,3 +2038,25 @@ char* msg = "Application started";
 ### Verify
 - `cargo test --lib` green (incl. `test_mmu_oob_ttbr_identity_maps`, abort diag)
 
+---
+
+## Session 59 — PC→0 fix + first goldfish UART lines
+
+### Cause of PC→0
+- Instr at `0x10768`: `mrc p15, 0, pc, c7, c14, 3` (`0xee17ff7e`)
+- We treated MRC Rd=15 as `write(PC, val)`; c7 read returned `0` → jump to 0
+
+### Fixes
+- MRC to R15 updates CPSR NZCV only (ARMv5), does not set PC
+- c7 MRC-to-PC sets Z so `mrc; bne` wait loops can exit
+- Goldfish boot tests use 256MB RAM
+
+### Result
+- UART earlyprintk works: `Uncompressing Linux...`
+- Then: `Out of memory while allocating workspace` → panic / `B .` halt at `0x4aecf4`
+- `cargo test --lib` → 131 passed
+
+### Next
+- Fix zImage decompress workspace OOM (malloc arena / free_mem_end)
+- Then continue toward full kernel init + more console output
+
