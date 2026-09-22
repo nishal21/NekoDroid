@@ -4,6 +4,8 @@ pub struct Cp15 {
     pub c1_sctlr: u32,
     pub c2_ttbr0: u32,
     pub c3_dacr: u32,
+    pub c5_dfsr: u32,
+    pub c6_dfar: u32,
 }
 
 impl Cp15 {
@@ -15,6 +17,8 @@ impl Cp15 {
             c1_sctlr: 0x0000_0C12,
             c2_ttbr0: 0,
             c3_dacr: 0,
+            c5_dfsr: 0,
+            c6_dfar: 0,
         }
     }
 
@@ -24,6 +28,8 @@ impl Cp15 {
             (1, 0, 0, 0) => self.c1_sctlr,
             (2, 0, 0, 0) => self.c2_ttbr0,
             (3, 0, 0, 0) => self.c3_dacr,
+            (5, 0, 0, 0) => self.c5_dfsr,
+            (6, 0, 0, 0) => self.c6_dfar,
             // CP15 c7/c8 maintenance/status reads are modeled as benign zero.
             (7, _, _, _) | (8, _, _, _) => 0,
             _ => {
@@ -41,6 +47,8 @@ impl Cp15 {
             (1, 0, 0, 0) => self.c1_sctlr = val,
             (2, 0, 0, 0) => self.c2_ttbr0 = val,
             (3, 0, 0, 0) => self.c3_dacr = val,
+            (5, 0, 0, 0) => self.c5_dfsr = val,
+            (6, 0, 0, 0) => self.c6_dfar = val,
             // CP15 c7/c8 maintenance operations (cache/TLB/BTB) are no-ops in this model.
             // Linux uses these during MMU enable/transition; treat them as supported.
             (7, _, _, _) | (8, _, _, _) => {}

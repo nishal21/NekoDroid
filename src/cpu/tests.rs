@@ -1505,6 +1505,15 @@
     }
 
     #[test]
+    fn test_mmu_oob_ttbr_identity_maps() {
+        let mut cpu = Cpu::new(1024 * 1024);
+        cpu.cp15.c1_sctlr = 1;
+        cpu.cp15.c2_ttbr0 = 0xffff_c000; // outside RAM — goldfish zImage did this
+        assert_eq!(cpu.translate_address(0x0001_0000), 0x0001_0000);
+        assert_eq!(cpu.abort_count, 0);
+    }
+
+    #[test]
     fn test_mmu_coarse_page_translation() {
         let mut cpu = Cpu::new(8 * 1024 * 1024); // 8 MB RAM to cover 0x0050_1000
 

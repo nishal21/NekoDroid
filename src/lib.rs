@@ -883,22 +883,105 @@ mod tests {
         // Decompression often needs millions of instructions before earlyprintk.
         if uart_lines.is_empty() && uart_partial.is_empty() {
             let more = run_batch(2_000_000, 50_000);
-            let (pc2, lines2, partial2) = ARM_CPU.with(|cell| {
+            let diag = ARM_CPU.with(|cell| {
                 let b = cell.borrow();
                 let c = b.as_ref().expect("cpu");
                 (
                     c.regs.pc(),
                     c.mmu.uart_lines.clone(),
                     c.mmu.uart_buffer().to_string(),
+                    c.abort_count,
+                    c.last_abort_vaddr,
+                    c.last_abort_sctlr,
+                    c.last_abort_ttbr0,
+                    c.last_abort_pc,
+                    c.mmu_enable_pc,
+                    c.cp15.c1_sctlr,
+                    c.regs.cpu_mode(),
                 )
             });
             eprintln!(
-                "goldfish uart long: more={more} pc={pc2:#x} lines={} partial={:?}",
-                lines2.len(),
-                partial2.chars().take(120).collect::<String>()
+                "goldfish uart long: more={more} pc={:#x} lines={} partial={:?} aborts={} first_abort_va={:#x} abort_sctlr={:#x} abort_ttbr={:#x} abort_pc={:#x} mmu_on_at={:?} sctlr_now={:#x} mode={:#x}",
+                diag.0,
+                diag.1.len(),
+                diag.2.chars().take(120).collect::<String>(),
+                diag.3,
+                diag.4,
+                diag.5,
+                diag.6,
+                diag.7,
+                diag.8,
+                diag.9,
+                diag.10,
             );
-            // Progress already asserted; UART may still be empty if decompress stalls.
-            let _ = lines2;
+            let _ = diag.1;
         }
+    }
+
+    /// Focused abort diagnostic for goldfish zImage (skips if no image).
+    #[test]
+    fn test_optional_goldfish_abort_diag() {
+        let path = std::path::Path::new("test-images/zImage");
+        if !path.exists() {
+            return;
+        }
+        let kernel = std::fs::read(path).expect("read zImage");
+        ARM_CPU.with(|cell| {
+            *cell.borrow_mut() = Some(cpu::Cpu::new(64 * 1024 * 1024));
+        });
+        assert!(boot_linux_kernel(&kernel, &[]));
+
+        let mut first_low: Option<(u32, u32)> = None; // (step, pc)
+        for i in 0..3_000_000u32 {
+            let (aborts, pc, mmu_pc, sctlr) = ARM_CPU.with(|cell| {
+                let b = cell.borrow();
+                let c = b.as_ref().unwrap();
+                (c.abort_count, c.regs.pc(), c.mmu_enable_pc, c.cp15.c1_sctlr)
+            });
+            if first_low.is_none() && pc < 0x8000 {
+                first_low = Some((i, pc));
+            }
+            if aborts > 0 {
+                let d = ARM_CPU.with(|cell| {
+                    let b = cell.borrow();
+                    let c = b.as_ref().unwrap();
+                    (
+                        c.abort_count,
+                        c.last_abort_vaddr,
+                        c.last_abort_sctlr,
+                        c.last_abort_ttbr0,
+                        c.last_abort_pc,
+                        c.mmu_enable_pc,
+                        i,
+                        pc,
+                    )
+                });
+                eprintln!(
+                    "first abort at step {}: va={:#x} sctlr={:#x} ttbr0={:#x} pc_at_abort={:#x} mmu_enable_pc={:?} pc_now={:#x} aborts={} first_low={:?}",
+                    d.6, d.1, d.2, d.3, d.4, d.5, d.7, d.0, first_low
+                );
+                assert!(d.0 >= 1);
+                return;
+            }
+            if !step_cpu() {
+                break;
+            }
+            let _ = (mmu_pc, sctlr);
+        }
+        let (aborts, pc, sctlr, mmu_pc, lines) = ARM_CPU.with(|cell| {
+            let b = cell.borrow();
+            let c = b.as_ref().unwrap();
+            (
+                c.abort_count,
+                c.regs.pc(),
+                c.cp15.c1_sctlr,
+                c.mmu_enable_pc,
+                c.mmu.uart_lines.len(),
+            )
+        });
+        eprintln!(
+            "no abort in budget: pc={:#x} sctlr={:#x} aborts={} mmu_enable_pc={:?} first_low={:?} uart_lines={}",
+            pc, sctlr, aborts, mmu_pc, first_low, lines
+        );
     }
 }

@@ -396,6 +396,13 @@ pub struct Cpu {
     exception_raised: bool,
     /// Optional HLE BIOS SWI-vector intercept for toy userspace demos.
     hle_bios_enabled: bool,
+    /// Diagnostics for MMU/data-abort debugging (goldfish boot).
+    pub abort_count: u32,
+    pub last_abort_vaddr: u32,
+    pub last_abort_sctlr: u32,
+    pub last_abort_ttbr0: u32,
+    pub last_abort_pc: u32,
+    pub mmu_enable_pc: Option<u32>,
 }
 
 impl Cpu {
@@ -408,6 +415,12 @@ impl Cpu {
             halted: false,
             exception_raised: false,
             hle_bios_enabled: true,
+            abort_count: 0,
+            last_abort_vaddr: 0,
+            last_abort_sctlr: 0,
+            last_abort_ttbr0: 0,
+            last_abort_pc: 0,
+            mmu_enable_pc: None,
         }
     }
 
@@ -420,6 +433,12 @@ impl Cpu {
             halted: false,
             exception_raised: false,
             hle_bios_enabled: true,
+            abort_count: 0,
+            last_abort_vaddr: 0,
+            last_abort_sctlr: 0,
+            last_abort_ttbr0: 0,
+            last_abort_pc: 0,
+            mmu_enable_pc: None,
         }
     }
 
@@ -431,6 +450,12 @@ impl Cpu {
         self.halted = false;
         self.exception_raised = false;
         self.hle_bios_enabled = true;
+        self.abort_count = 0;
+        self.last_abort_vaddr = 0;
+        self.last_abort_sctlr = 0;
+        self.last_abort_ttbr0 = 0;
+        self.last_abort_pc = 0;
+        self.mmu_enable_pc = None;
         // Clear UART output buffer
         self.mmu.clear_uart_buffer();
         // Clear VRAM to black
@@ -530,8 +555,21 @@ impl Cpu {
             return vaddr;
         }
 
+        // While servicing a data abort, identity-map the low vector page so we
+        // do not re-enter abort forever when page tables are incomplete.
+        if self.regs.cpu_mode() == MODE_ABT && vaddr < 0x1000 {
+            return vaddr;
+        }
+
         // 2. TTBR0 base (short-descriptor, first-level table)
         let table_base = self.cp15.c2_ttbr0 & 0xFFFF_C000;
+
+        // If TTBR points outside RAM, page-table walks would read zeros and
+        // fault every instruction (seen with goldfish zImage → TTBR=0xffffc000).
+        // Identity-map until the guest installs tables in RAM.
+        if (table_base as usize) >= self.mmu.ram_size() {
+            return vaddr;
+        }
 
         // 3. First-level index from VA[31:20]
         let table_index = vaddr >> 20;
@@ -552,45 +590,52 @@ impl Cpu {
             return phys_base | offset;
         } else if desc_type == 0b01 {
             // Coarse Page Table mapping (Level 2 walk for 4KB pages)
-            // 1. Base of L2 table from L1 descriptor bits [31:10]
             let l2_base = descriptor & 0xFFFF_FC00;
-
-            // 2. L2 index from VA[19:12]
+            if (l2_base as usize) >= self.mmu.ram_size() {
+                return vaddr;
+            }
             let l2_index = (vaddr >> 12) & 0xFF;
-
-            // 3. Address of L2 descriptor
             let l2_desc_addr = l2_base | (l2_index << 2);
-
-            // 4. Read L2 descriptor from physical memory
             let l2_desc = self.mmu.read_u32(l2_desc_addr);
 
-            // 5. Small page descriptor type: bits [1:0] == 0b10
             if (l2_desc & 0b11) == 0b10 {
                 let phys_base = l2_desc & 0xFFFF_F000;
                 let offset = vaddr & 0x0000_0FFF;
                 return phys_base | offset;
             }
 
-            #[cfg(not(test))]
-            {
-                crate::log(&format!(
-                    "⚠️ MMU Fault: Unhandled L2 descriptor {:#010X} at vaddr {:#010X}",
-                    l2_desc, vaddr
-                ));
+            // Soft identity for in-RAM VAs when L2 is incomplete (early boot).
+            if (vaddr as usize) < self.mmu.ram_size() {
+                return vaddr;
             }
+
+            self.record_data_abort(vaddr);
             self.trigger_exception("Data Abort", MODE_ABT, 0x10, 8);
             return vaddr;
         } else {
-            #[cfg(not(test))]
-            {
-                crate::log(&format!(
-                    "⚠️ MMU Fault: Unhandled L1 descriptor type {} at vaddr {:#010X}",
-                    desc_type, vaddr
-                ));
+            // Faulting L1: identity-map RAM VAs during early boot instead of
+            // wedging on the abort vector with empty tables.
+            if (vaddr as usize) < self.mmu.ram_size() {
+                return vaddr;
             }
+
+            self.record_data_abort(vaddr);
             self.trigger_exception("Data Abort", MODE_ABT, 0x10, 8);
             return vaddr;
         }
+    }
+
+    fn record_data_abort(&mut self, vaddr: u32) {
+        self.abort_count = self.abort_count.wrapping_add(1);
+        if self.abort_count == 1 {
+            self.last_abort_vaddr = vaddr;
+            self.last_abort_sctlr = self.cp15.c1_sctlr;
+            self.last_abort_ttbr0 = self.cp15.c2_ttbr0;
+            self.last_abort_pc = self.regs.pc();
+        }
+        // CP15 fault status (short-descriptor DFSR/DFAR) for guests that read them
+        self.cp15.c5_dfsr = 0x5; // translation fault section
+        self.cp15.c6_dfar = vaddr;
     }
 
     pub fn read_mem_u8(&mut self, vaddr: u32) -> u8 {
@@ -1089,7 +1134,14 @@ impl Cpu {
                     self.regs.write(rd, val);
                 } else {
                     let val = self.regs.read(rd);
+                    let prev_m = self.cp15.c1_sctlr & 1;
                     self.cp15.write_register(crn, crm, opc1, opc2, val);
+                    if crn == 1 && crm == 0 && opc1 == 0 && opc2 == 0 {
+                        let now_m = self.cp15.c1_sctlr & 1;
+                        if prev_m == 0 && now_m != 0 && self.mmu_enable_pc.is_none() {
+                            self.mmu_enable_pc = Some(pc_at_fetch);
+                        }
+                    }
                 }
             } else {
                 #[cfg(not(test))]

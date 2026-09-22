@@ -2017,3 +2017,24 @@ char* msg = "Application started";
 - Then earlyprintk lines should show on Goldfish TTY
 - Optional initrd once decompress survives
 
+---
+
+## Session 58 — Data-abort diagnosis + OOB TTBR identity map
+
+### Found
+- First abort was MMU on (`sctlr=0x5c3f`) with `ttbr0=0xffffc000` (outside RAM)
+- Table walks read zeros → translation fault → PC stuck at abort vector `0x10`
+
+### Fix
+- If TTBR/L2 base is outside RAM, identity-map
+- Soft identity for in-RAM VAs when L1/L2 descriptors are empty
+- Abort storm guard for low vectors in ABT mode
+- CP15 DFSR/DFAR + abort diagnostics (`abort_count`, `mmu_enable_pc`, …)
+
+### Still open
+- After fix: no aborts, but PC drops to `0` around step ~333k (`first_low`), ends near `0x3c`
+- Still no UART lines — next: why PC→0 after MMU enable at `0x103c0`
+
+### Verify
+- `cargo test --lib` green (incl. `test_mmu_oob_ttbr_identity_maps`, abort diag)
+
