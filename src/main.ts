@@ -63,7 +63,7 @@ app.innerHTML = `
     <div class="canvas-wrapper" id="canvas-wrapper"></div>
 
     <div class="controls">
-      <button id="btn-noise" class="active">
+      <button id="btn-noise">
         <span class="btn-icon">📺</span>
         Noise
       </button>
@@ -75,7 +75,7 @@ app.innerHTML = `
         <span class="btn-icon">🔮</span>
         Plasma
       </button>
-      <button id="btn-vram">
+      <button id="btn-vram" class="active">
         <span class="btn-icon">🖥️</span>
         VRAM
       </button>
@@ -101,7 +101,7 @@ app.innerHTML = `
         </div>
         <div class="metric">
           <span class="metric-label">Mode</span>
-          <span class="metric-value" id="mode-display">noise</span>
+          <span class="metric-value" id="mode-display">vram</span>
         </div>
       </div>
       <div class="console-log" id="console-log">
@@ -236,7 +236,7 @@ async function main() {
     addLog(`VirtualCPU created: ${screenWidth}×${screenHeight} RGBA framebuffer (${cpu.framebuffer_len()} bytes)`, 'success');
 
     // ── Render state ──────────────────────────────────────────────
-    let mode: RenderMode = 'noise';
+    let mode: RenderMode = 'vram';
     let paused = false;
     let running = false;  // Continuous CPU execution mode
     const BATCH_SIZE = 1_000_000; // Higher throughput helps Linux decompression/boot progress
@@ -687,9 +687,21 @@ async function main() {
       romFileInput.click();
     });
 
+    function fileTooLarge(file: File, label: string): boolean {
+      if (file.size > MAX_UPLOAD_BYTES) {
+        addLog(`${label} too large (${file.size} bytes). Limit is ${MAX_UPLOAD_BYTES}.`, 'system');
+        return true;
+      }
+      return false;
+    }
+
     romFileInput.addEventListener('change', () => {
       const file = romFileInput.files?.[0];
       if (!file) return;
+      if (fileTooLarge(file, 'ROM')) {
+        romFileInput.value = '';
+        return;
+      }
       const reader = new FileReader();
       reader.onload = () => {
         const buffer = reader.result as ArrayBuffer;
@@ -726,6 +738,11 @@ async function main() {
     kernelInput.addEventListener('change', () => {
       const file = kernelInput.files?.[0];
       if (!file) return;
+      if (fileTooLarge(file, 'Kernel')) {
+        kernelInput.value = '';
+        pendingKernel = null;
+        return;
+      }
 
       const reader = new FileReader();
       reader.onload = () => {
@@ -742,6 +759,11 @@ async function main() {
       if (!file) {
         pendingInitrd = new Uint8Array();
         addLog('Initramfs cleared (empty)', 'info');
+        return;
+      }
+      if (fileTooLarge(file, 'Initramfs')) {
+        initrdInput.value = '';
+        pendingInitrd = new Uint8Array();
         return;
       }
 
@@ -807,8 +829,7 @@ async function main() {
     apkInput.addEventListener('change', () => {
       const file = apkInput.files?.[0];
       if (!file) return;
-      if (file.size > MAX_UPLOAD_BYTES) {
-        addLog(`APK too large (${file.size} bytes). Limit is ${MAX_UPLOAD_BYTES}.`, 'system');
+      if (fileTooLarge(file, 'APK')) {
         apkInput.value = '';
         return;
       }

@@ -5,7 +5,7 @@ Minimal APK sources for the HLE path.
 The committed binaries live in `../../testdata/` and are produced by:
 
 ```bash
-cargo test --lib write_fixtures_to_testdata
+NEKODROID_WRITE_FIXTURES=1 cargo test --lib write_fixtures_to_testdata
 ```
 
 Optional rebuild with [smali](https://github.com/JesusFreke/smali) (if installed):

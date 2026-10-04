@@ -1,5 +1,30 @@
 # nekodroid — Development Log
 
+## Session 63 — HLE correctness, not a store-APK runtime
+
+### Proven and fixed
+- Binary manifest: a `com.*` ASCII token is not a package. Launcher activity comes from the AXML activity that has MAIN + LAUNCHER
+- `<init>`, `setContentView`, and `getLastTouchX` are not name-only stubs. App constructors and those methods run from DEX. Framework classes still have the small HLE hooks
+- `iget`/`iput` (int and object, plus narrow int forms) store on the HLE instance. MUTF-8 `C0 80` decodes as NUL
+- APK, inflated `classes.dex`, string-id tables, `insns_size`, and `new-array` length are rejected when they do not fit. ROM, kernel, initrd, and system image uploads share the 32 MiB cap. Table offsets use checked `u32` math
+- `boot_android` returns failure for empty input or a dropped/invalid APK. A supplied APK runs on the HLE VM. A kernel is only loaded. This is not Android boot
+- `get_cpu_state` escapes `\` before `"`
+- `write_fixtures_to_testdata` does not rewrite `testdata/` unless `NEKODROID_WRITE_FIXTURES=1`
+- Canvas default mode is ARM VRAM
+
+### Verify
+- `cargo test --lib` → 153 passed
+
+### Still cannot run a Play Store APK
+No ART, no framework, no multidex/JNI/`resources.arsc`, no wide fields, most opcodes missing. Missing methods still return 0.
+
+### Next
+- More opcodes only when a fixture needs them
+- Do not describe `boot_android` as an Android userspace boot
+
+---
+
+
 > A record of every development session: what was built, what was discovered, and what's next.
 
 ---

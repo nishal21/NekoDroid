@@ -15,8 +15,14 @@ pub struct HleHost {
 #[derive(Debug, Clone)]
 pub enum HleObject {
     String(String),
-    Instance { class: String, fields: Vec<(u32, Value)> },
-    Array { len: i32, elems: Vec<Value> },
+    Instance {
+        class: String,
+        fields: Vec<(u32, Value)>,
+    },
+    Array {
+        len: i32,
+        elems: Vec<Value>,
+    },
     Null,
 }
 
@@ -50,13 +56,55 @@ impl HleHost {
         Value::Obj(self.objects.len() as u32)
     }
 
-    pub fn alloc_array(&mut self, len: i32) -> Value {
-        let n = len.max(0) as usize;
+    /// Rejects negative lengths and lengths above 1 MiB elements.
+    pub fn alloc_array(&mut self, len: i32) -> crate::android::error::Result<Value> {
+        const MAX_ARRAY_LEN: i32 = 1_048_576;
+        if len < 0 || len > MAX_ARRAY_LEN {
+            return Err(crate::android::error::AndroidError::Vm(format!(
+                "new-array length {len} rejected (cap {MAX_ARRAY_LEN})"
+            )));
+        }
+        let n = len as usize;
         self.objects.push(HleObject::Array {
             len,
             elems: vec![Value::Int(0); n],
         });
-        Value::Obj(self.objects.len() as u32)
+        Ok(Value::Obj(self.objects.len() as u32))
+    }
+
+    pub fn instance_get(&self, obj: Value, field: u32) -> Option<Value> {
+        let Value::Obj(i) = obj else {
+            return None;
+        };
+        if i == 0 {
+            return None;
+        }
+        match self.objects.get((i - 1) as usize) {
+            Some(HleObject::Instance { fields, .. }) => {
+                fields.iter().find(|(id, _)| *id == field).map(|(_, v)| *v)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn instance_put(&mut self, obj: Value, field: u32, val: Value) -> bool {
+        let Value::Obj(i) = obj else {
+            return false;
+        };
+        if i == 0 {
+            return false;
+        }
+        match self.objects.get_mut((i - 1) as usize) {
+            Some(HleObject::Instance { fields, .. }) => {
+                if let Some(slot) = fields.iter_mut().find(|(id, _)| *id == field) {
+                    slot.1 = val;
+                } else {
+                    fields.push((field, val));
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn array_len(&self, v: Value) -> Option<i32> {
@@ -118,11 +166,7 @@ impl HleHost {
     }
 
     /// Returns Some(result) if HLE handled the invoke; None to run DEX code.
-    pub fn try_invoke(
-        &mut self,
-        method: &MethodId,
-        args: &[Value],
-    ) -> Option<Value> {
+    pub fn try_invoke(&mut self, method: &MethodId, args: &[Value]) -> Option<Value> {
         let class = method.class.as_str();
         let name = method.name.as_str();
 
@@ -131,7 +175,10 @@ impl HleHost {
             let msg = args
                 .get(1)
                 .and_then(|v| self.get_string(*v).map(|s| s.to_string()))
-                .or_else(|| args.first().and_then(|v| self.get_string(*v).map(|s| s.to_string())))
+                .or_else(|| {
+                    args.first()
+                        .and_then(|v| self.get_string(*v).map(|s| s.to_string()))
+                })
                 .unwrap_or_else(|| "<null>".into());
             let tag = args
                 .first()
@@ -160,8 +207,8 @@ impl HleHost {
             return Some(Value::Int(0));
         }
 
-        // TextView.setText
-        if name == "setText" && class.contains("TextView") {
+        // TextView.setText — framework class only. An app method of the same name runs DEX.
+        if is_framework_class(class) && name == "setText" && class.contains("TextView") {
             let msg = args
                 .get(1)
                 .or_else(|| args.first())
@@ -172,27 +219,32 @@ impl HleHost {
             return Some(Value::Int(0));
         }
 
-        // Activity.<init> / Object.<init>
-        if name == "<init>" {
+        // Framework Activity hooks. App methods with these names are not stubs.
+        // `<init>` is intentionally not listed: app constructors live in DEX,
+        // and a missing framework `<init>` falls through to the no-code stub.
+        if is_framework_class(class) && matches!(name, "setContentView" | "setTitle") {
             return Some(Value::Int(0));
         }
 
-        // Activity.setContentView / onCreate empty stubs
-        if matches!(name, "setContentView" | "setTitle") {
-            return Some(Value::Int(0));
-        }
-
-        // MotionEvent-ish: Activity stubs can read last touch via HLE fields
-        if name == "getLastTouchX" {
+        if is_framework_class(class) && name == "getLastTouchX" {
             return Some(Value::Int(self.touch_x));
         }
-        if name == "getLastTouchY" {
+        if is_framework_class(class) && name == "getLastTouchY" {
             return Some(Value::Int(self.touch_y));
         }
-        if name == "isTouchDown" {
+        if is_framework_class(class) && name == "isTouchDown" {
             return Some(Value::Int(if self.touch_down { 1 } else { 0 }));
         }
 
         None
     }
+}
+
+fn is_framework_class(class: &str) -> bool {
+    class.starts_with("Landroid/")
+        || class.starts_with("Ljava/")
+        || class.starts_with("Ljavax/")
+        || class.starts_with("Ldalvik/")
+        || class.starts_with("Llibcore/")
+        || class.starts_with("Lcom/android/")
 }

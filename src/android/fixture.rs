@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 use crate::android::error::Result;
 
@@ -157,8 +157,7 @@ pub fn build_hello_apk() -> Result<Vec<u8>> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
         let mut zip = ZipWriter::new(&mut cursor);
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("classes.dex", opts)
             .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
         zip.write_all(&dex)
@@ -169,6 +168,279 @@ pub fn build_hello_apk() -> Result<Vec<u8>> {
             b"#nekodroid-manifest\npackage=com.nekodroid\nactivity=Lcom/nekodroid/Hello;\n",
         )
         .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
+        zip.finish()
+            .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
+    }
+    Ok(cursor.into_inner())
+}
+
+/// Two classes. `MainActivity.main` logs `WRONG`. `HelloScreen.main` logs `RIGHT`.
+/// The binary manifest's launcher is `.HelloScreen`, and the string pool starts
+/// with `com.decoy.other` so an ASCII scan would pick the wrong package.
+pub fn build_launcher_confusion_apk() -> Result<Vec<u8>> {
+    let dex = build_two_class_dex()?;
+    let manifest = crate::android::axml::encode_binary_manifest(
+        "com.nekodroid",
+        "com.nekodroid.MainActivity",
+        ".HelloScreen",
+    );
+    zip_apk(&dex, &manifest)
+}
+
+/// Constructor stores a string field; a later method reads it.
+/// Also has app methods named `setContentView` and `getLastTouchX` that must run.
+pub fn build_instance_field_dex() -> Result<Vec<u8>> {
+    let mut b = DexBuilder::new();
+    let s_ok = b.string("field-ok");
+    let s_ran = b.string("ran-setContentView");
+    let s_main = b.string("main");
+    let s_init = b.string("<init>");
+    let s_read = b.string("read");
+    let s_set = b.string("setContentView");
+    let s_touch = b.string("getLastTouchX");
+    let s_println = b.string("println");
+    let s_print_int = b.string("printInt");
+    let s_v = b.string("V");
+    let s_vl = b.string("VL");
+    let s_l = b.string("L");
+    let s_i = b.string("I");
+    let s_vi = b.string("VI");
+    let s_val = b.string("V[L");
+
+    let t_box = b.type_of("Lcom/nekodroid/Box;");
+    let t_object = b.type_of("Ljava/lang/Object;");
+    let t_hle = b.type_of("Lnekodroid/Hle;");
+    let t_string = b.type_of("Ljava/lang/String;");
+    let t_string_arr = b.type_of("[Ljava/lang/String;");
+    let t_void = b.type_of("V");
+    let t_int = b.type_of("I");
+
+    let p_void = b.proto(s_v, t_void, &[]);
+    let p_str_void = b.proto(s_vl, t_void, &[t_string]);
+    let p_ret_str = b.proto(s_l, t_string, &[]);
+    let p_ret_int = b.proto(s_i, t_int, &[]);
+    let p_print_int = b.proto(s_vi, t_void, &[t_int]);
+    let p_main = b.proto(s_val, t_void, &[t_string_arr]);
+
+    let m_println = b.method(t_hle, p_str_void, s_println);
+    let m_print_int = b.method(t_hle, p_print_int, s_print_int);
+    let m_init = b.method(t_box, p_str_void, s_init);
+    let m_read = b.method(t_box, p_ret_str, s_read);
+    let m_set = b.method(t_box, p_void, s_set);
+    let m_touch = b.method(t_box, p_ret_int, s_touch);
+    let m_main = b.method(t_box, p_main, s_main);
+
+    // <init>(String): iput-object v1, v0, field@0; return-void
+    let code_init = CodeBlob {
+        registers_size: 2,
+        ins_size: 2,
+        outs_size: 0,
+        insns: vec![0x015b, 0x0000, 0x000e],
+    };
+    // read(): iget-object v0, v1, field@0; return-object v0
+    let code_read = CodeBlob {
+        registers_size: 2,
+        ins_size: 1,
+        outs_size: 0,
+        insns: vec![0x1054, 0x0000, 0x0011],
+    };
+    // setContentView(): const-string v0; invoke-static println; return-void
+    let code_set = CodeBlob {
+        registers_size: 2,
+        ins_size: 1,
+        outs_size: 1,
+        insns: vec![
+            0x001a,
+            s_ran as u16,
+            0x1071,
+            m_println as u16,
+            0x0000,
+            0x000e,
+        ],
+    };
+    // getLastTouchX(): const/16 v0, #42; return v0
+    let code_touch = CodeBlob {
+        registers_size: 2,
+        ins_size: 1,
+        outs_size: 0,
+        insns: vec![0x0013, 42, 0x000f],
+    };
+    let code_main = CodeBlob {
+        registers_size: 3,
+        ins_size: 1,
+        outs_size: 2,
+        insns: vec![
+            0x0022,
+            t_box as u16, // new-instance v0
+            0x011a,
+            s_ok as u16, // const-string v1
+            0x2070,
+            m_init as u16,
+            0x0010, // invoke-direct {v0, v1}
+            0x1070,
+            m_read as u16,
+            0x0000, // invoke-direct {v0}
+            0x010c, // move-result-object v1
+            0x1071,
+            m_println as u16,
+            0x0001, // invoke-static {v1}
+            0x1070,
+            m_set as u16,
+            0x0000,
+            0x1070,
+            m_touch as u16,
+            0x0000,
+            0x010a, // move-result v1
+            0x1071,
+            m_print_int as u16,
+            0x0001,
+            0x000e,
+        ],
+    };
+
+    b.add_class(
+        t_box,
+        t_object,
+        vec![
+            EncodedMeth {
+                method_idx: m_init,
+                access_flags: 0x10001,
+                code: Some(code_init),
+            },
+            EncodedMeth {
+                method_idx: m_read,
+                access_flags: 0x0001,
+                code: Some(code_read),
+            },
+            EncodedMeth {
+                method_idx: m_set,
+                access_flags: 0x0001,
+                code: Some(code_set),
+            },
+            EncodedMeth {
+                method_idx: m_touch,
+                access_flags: 0x0001,
+                code: Some(code_touch),
+            },
+            EncodedMeth {
+                method_idx: m_main,
+                access_flags: 0x0009,
+                code: Some(code_main),
+            },
+        ],
+    );
+    Ok(b.finish())
+}
+
+/// `const v0, #0x7fffffff; new-array v1, v0` — must be rejected, not allocated.
+pub fn build_huge_array_dex() -> Result<Vec<u8>> {
+    let mut b = DexBuilder::new();
+    let s_run = b.string("run");
+    let s_v = b.string("V");
+    let t_box = b.type_of("Lcom/nekodroid/Huge;");
+    let t_object = b.type_of("Ljava/lang/Object;");
+    let t_int_arr = b.type_of("[I");
+    let t_void = b.type_of("V");
+    let p_void = b.proto(s_v, t_void, &[]);
+    let m_run = b.method(t_box, p_void, s_run);
+    let code = CodeBlob {
+        registers_size: 2,
+        ins_size: 0,
+        outs_size: 0,
+        insns: vec![
+            0x0014, // const v0
+            0xffff,
+            0x7fff,
+            0x0123, // new-array v1, v0, type@t_int_arr
+            t_int_arr as u16,
+            0x000e,
+        ],
+    };
+    b.add_class(
+        t_box,
+        t_object,
+        vec![EncodedMeth {
+            method_idx: m_run,
+            access_flags: 0x0009,
+            code: Some(code),
+        }],
+    );
+    Ok(b.finish())
+}
+
+fn build_two_class_dex() -> Result<Vec<u8>> {
+    let mut b = DexBuilder::new();
+    let s_wrong = b.string("WRONG");
+    let s_right = b.string("RIGHT");
+    let s_main = b.string("main");
+    let s_println = b.string("println");
+    let s_vl = b.string("VL");
+    let s_val = b.string("V[L");
+    let t_main = b.type_of("Lcom/nekodroid/MainActivity;");
+    let t_hello = b.type_of("Lcom/nekodroid/HelloScreen;");
+    let t_object = b.type_of("Ljava/lang/Object;");
+    let t_hle = b.type_of("Lnekodroid/Hle;");
+    let t_string = b.type_of("Ljava/lang/String;");
+    let t_string_arr = b.type_of("[Ljava/lang/String;");
+    let t_void = b.type_of("V");
+    let p_println = b.proto(s_vl, t_void, &[t_string]);
+    let p_main = b.proto(s_val, t_void, &[t_string_arr]);
+    let m_println = b.method(t_hle, p_println, s_println);
+    let m_wrong = b.method(t_main, p_main, s_main);
+    let m_right = b.method(t_hello, p_main, s_main);
+
+    let code_wrong = println_main(s_wrong, m_println);
+    let code_right = println_main(s_right, m_println);
+    b.add_class(
+        t_main,
+        t_object,
+        vec![EncodedMeth {
+            method_idx: m_wrong,
+            access_flags: 0x0009,
+            code: Some(code_wrong),
+        }],
+    );
+    b.add_class(
+        t_hello,
+        t_object,
+        vec![EncodedMeth {
+            method_idx: m_right,
+            access_flags: 0x0009,
+            code: Some(code_right),
+        }],
+    );
+    Ok(b.finish())
+}
+
+fn println_main(string_idx: u32, println_idx: u32) -> CodeBlob {
+    CodeBlob {
+        registers_size: 2,
+        ins_size: 1,
+        outs_size: 1,
+        insns: vec![
+            0x001a,
+            string_idx as u16,
+            0x1071,
+            println_idx as u16,
+            0x0000,
+            0x000e,
+        ],
+    }
+}
+
+fn zip_apk(dex: &[u8], manifest: &[u8]) -> Result<Vec<u8>> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("classes.dex", opts)
+            .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
+        zip.write_all(dex)
+            .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
+        zip.start_file("AndroidManifest.xml", opts)
+            .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
+        zip.write_all(manifest)
+            .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
         zip.finish()
             .map_err(|e| crate::android::error::AndroidError::Runtime(e.to_string()))?;
     }

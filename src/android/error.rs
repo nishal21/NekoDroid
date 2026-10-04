@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AndroidError {
+    #[error("input exceeds size cap: {0}")]
+    TooLarge(String),
     #[error("not a ZIP/APK: {0}")]
     NotZip(String),
     #[error("missing classes.dex in APK")]

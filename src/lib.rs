@@ -8,11 +8,15 @@ pub mod cp15;
 pub mod android;
 
 // ── Browser bindings ──────────────────────────────────────────────────
+#[cfg(not(test))]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
 }
+
+#[cfg(test)]
+fn log(_s: &str) {}
 
 // ── Constants ─────────────────────────────────────────────────────────
 const SCREEN_WIDTH: usize = 800;
@@ -194,7 +198,7 @@ thread_local! {
     static APK_RT: RefCell<Option<android::AppRuntime>> = RefCell::new(None);
 }
 
-const MAX_UPLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MiB APK/ROM soft cap
+const MAX_UPLOAD_BYTES: usize = android::apk::MAX_CONTAINER_BYTES;
 
 
 /// Initializes the emulator with configurable RAM.
@@ -249,10 +253,7 @@ pub fn get_cpu_state() -> String {
                     .map(|i| {
                         let addr = pc.wrapping_add(i * 4);
                         let asm = cpu.disassemble_at(addr);
-                        // Escape quotes for JSON
-                        let escaped = asm.replace('"', "\\\"")
-                            .replace('\\', "\\\\");
-                        format!("\"0x{:08X}: {}\"", addr, escaped)
+                        format!("\"0x{:08X}: {}\"", addr, json_escape(&asm))
                     })
                     .collect();
 
@@ -452,6 +453,9 @@ pub fn load_custom_hex(hex_string: &str) -> bool {
 /// Loads a raw binary payload (e.g., compiled C code) into RAM at 0x8000.
 #[wasm_bindgen]
 pub fn load_rom(bytes: &[u8]) -> bool {
+    if reject_upload(bytes.len(), "ROM") {
+        return false;
+    }
     ARM_CPU.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if let Some(cpu) = borrow.as_mut() {
@@ -472,6 +476,9 @@ pub fn load_rom(bytes: &[u8]) -> bool {
 /// Loads and boots a Linux kernel zImage/Image.
 #[wasm_bindgen]
 pub fn boot_linux_kernel(kernel_bytes: &[u8], initrd_bytes: &[u8]) -> bool {
+    if reject_upload(kernel_bytes.len(), "kernel") || reject_upload(initrd_bytes.len(), "initrd") {
+        return false;
+    }
     ARM_CPU.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if let Some(cpu) = borrow.as_mut() {
@@ -499,10 +506,13 @@ pub fn get_cp15_midr() -> u32 {
 
 // ── Android APK & System Image Support ────────────────────────────────
 
-/// Mounts an Android system image (ext4 partition) for the emulator.
-/// This makes the Android framework available to loaded APKs.
+/// Copies a system image into the emulated MMC so CMD17/CMD18 can read sectors.
+/// This does not install the Android framework and does not make HLE APKs able to call it.
 #[wasm_bindgen]
 pub fn mount_system_image(image_bytes: &[u8]) -> bool {
+    if image_bytes.is_empty() || reject_upload(image_bytes.len(), "system image") {
+        return false;
+    }
     ARM_CPU.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if let Some(cpu) = borrow.as_mut() {
@@ -703,51 +713,108 @@ fn draw_text_vram(mmu: &mut memory::Mmu, text: &str) {
 }
 
 
-/// Boots an Android kernel with system image and optional APK.
-/// This is the main entry point for running Android apps.
-/// 
+/// Load a kernel the same way `boot_linux_kernel` does, and/or run an APK on the Dalvik HLE.
+///
+/// Success means every non-empty input was actually accepted:
+/// a kernel is loaded and the PC is set to it; an APK is loaded, launched, and the VM
+/// executes at least one instruction. An APK is not queued for a later Android boot.
+/// This does not start zygote, ART, or a Play Store app.
+///
 /// # Arguments
-/// * `kernel_bytes` - The Android kernel zImage (e.g., goldfish_defconfig)
-/// * `system_img` - The Android system image (ext4 format)
-/// * `ramdisk_img` - Optional initramfs (can be empty)
-/// * `apk_bytes` - Optional APK to auto-launch after boot (can be empty)
+/// * `kernel_bytes` - Optional ARM Linux/Android kernel image (empty to skip)
+/// * `system_img` - Optional bytes for the emulated MMC (empty to skip)
+/// * `ramdisk_img` - Optional initramfs (empty to skip)
+/// * `apk_bytes` - Optional APK to execute on the HLE path (empty to skip)
 #[wasm_bindgen]
 pub fn boot_android(kernel_bytes: &[u8], system_img: &[u8], ramdisk_img: &[u8], apk_bytes: &[u8]) -> bool {
-    ARM_CPU.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        if let Some(cpu) = borrow.as_mut() {
-            // Mount system image first
+    if kernel_bytes.is_empty() && system_img.is_empty() && apk_bytes.is_empty() {
+        log("boot_android: nothing to boot or run");
+        return false;
+    }
+    if reject_upload(kernel_bytes.len(), "kernel")
+        || reject_upload(system_img.len(), "system image")
+        || reject_upload(ramdisk_img.len(), "initrd")
+        || reject_upload(apk_bytes.len(), "APK")
+    {
+        return false;
+    }
+
+    let cpu_ready = ARM_CPU.with(|cell| cell.borrow().is_some());
+    if !cpu_ready {
+        log("Cannot boot Android: CPU not initialized");
+        return false;
+    }
+
+    if !kernel_bytes.is_empty() {
+        let prepared = ARM_CPU.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let Some(cpu) = borrow.as_mut() else {
+                return false;
+            };
             if !system_img.is_empty() {
                 cpu.mmu.mmc_card_data = Some(system_img.to_vec());
-                log(&format!("🤖 Android system mounted: {} MB", system_img.len() / (1024*1024)));
+                log(&format!(
+                    "Android system image stored for MMC: {} bytes",
+                    system_img.len()
+                ));
             }
-            
-            // Set up Android-specific boot parameters
-            let initrd = if ramdisk_img.is_empty() { None } else { Some(ramdisk_img) };
-            
-            // Boot with Android machine ID (goldfish = 0x46F, versatile = 0x183)
-            // Android emulator uses goldfish machine ID
+            let initrd = if ramdisk_img.is_empty() {
+                None
+            } else {
+                Some(ramdisk_img)
+            };
             cpu.boot_linux(kernel_bytes, initrd, 0x046F);
-            
-            // Set Android-specific boot args registers
-            // R1 = machine type (already set by boot_linux)
-            // R2 = atags pointer (already set)
-            
             CYCLE_COUNT.store(0, Ordering::Relaxed);
-            
-            if !apk_bytes.is_empty() {
-                log(&format!("📦 APK queued for launch: {} bytes", apk_bytes.len()));
-                // TODO: Auto-launch APK after system boot completes
-                // This requires detecting when init finishes and launching the app
-            }
-            
-            log("🚀 Android boot initiated (Goldfish machine: 0x46F)");
             true
-        } else {
-            log("❌ Cannot boot Android: CPU not initialized");
-            false
+        });
+        if !prepared {
+            return false;
         }
-    })
+    } else if !system_img.is_empty() && !mount_system_image(system_img) {
+        return false;
+    }
+
+    if !apk_bytes.is_empty() {
+        if !load_apk(apk_bytes) || !launch_apk() {
+            return false;
+        }
+        let steps = run_dalvik_batch(50_000);
+        if steps == 0 {
+            log("boot_android: APK launched but executed no Dalvik instructions");
+            return false;
+        }
+        log(&format!("boot_android: HLE executed {steps} Dalvik steps"));
+    }
+    true
+}
+
+fn reject_upload(len: usize, label: &str) -> bool {
+    if len > MAX_UPLOAD_BYTES {
+        log(&format!(
+            "{label} rejected: {len} bytes exceeds {MAX_UPLOAD_BYTES} byte limit"
+        ));
+        true
+    } else {
+        false
+    }
+}
+
+/// JSON string escape. Backslashes first, then quotes.
+pub(crate) fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Returns the Android logger buffer as a formatted string for display.
@@ -802,6 +869,57 @@ pub fn clear_android_logs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_cpu() {
+        ARM_CPU.with(|cell| {
+            *cell.borrow_mut() = Some(cpu::Cpu::new(16 * 1024 * 1024));
+        });
+    }
+
+    #[test]
+    fn json_escape_escapes_backslashes_before_quotes() {
+        assert_eq!(json_escape(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(json_escape("line\n"), r#"line\n"#);
+    }
+
+    #[test]
+    fn boot_android_runs_apk_on_hle_or_fails() {
+        init_cpu();
+        assert!(!boot_android(&[], &[], &[], &[]));
+
+        let kernel = [0x00, 0x00, 0xA0, 0xE3];
+        assert!(boot_android(&kernel, &[], &[], &[]));
+        let pc = ARM_CPU.with(|cell| cell.borrow().as_ref().unwrap().regs.pc());
+        assert_eq!(pc, 0x0001_0000);
+
+        assert!(!boot_android(&kernel, &[], &[], b"not-an-apk"));
+
+        let apk = android::fixture::build_hello_apk().expect("apk");
+        APK_RT.with(|cell| *cell.borrow_mut() = None);
+        assert!(boot_android(&[], &[], &[], &apk));
+        let logs = get_dalvik_logs();
+        assert!(
+            logs.contains("Hello from NekoDroid"),
+            "APK was not executed, logs: {logs}"
+        );
+    }
+
+    #[test]
+    fn uploads_reject_over_32mib() {
+        init_cpu();
+        let big = vec![0u8; MAX_UPLOAD_BYTES + 1];
+        assert!(!load_rom(&big));
+        assert!(!boot_linux_kernel(&big, &[]));
+        assert!(!boot_linux_kernel(&kernel_word(), &big));
+        assert!(!mount_system_image(&big));
+        assert!(!mount_system_image(&[]));
+        assert!(!load_apk(&big));
+        assert!(!boot_android(&big, &[], &[], &[]));
+    }
+
+    fn kernel_word() -> [u8; 4] {
+        [0x00, 0x00, 0xA0, 0xE3]
+    }
 
     #[test]
     fn test_boot_linux_kernel_wrapper_uses_goldfish_machine_id() {

@@ -58,9 +58,7 @@ impl Vm {
     fn push_frame(&mut self, method_idx: u32, code: CodeItem, args: &[Value]) -> Result<()> {
         let mut regs = vec![Value::Int(0); code.registers_size as usize];
         // Ins are placed at the end of the register file.
-        let start = code
-            .registers_size
-            .saturating_sub(code.ins_size) as usize;
+        let start = code.registers_size.saturating_sub(code.ins_size) as usize;
         for (i, a) in args.iter().enumerate() {
             if start + i < regs.len() {
                 regs[start + i] = *a;
@@ -86,9 +84,8 @@ impl Vm {
 
         let pc = self.stack[frame_idx].pc;
         let insns = self.stack[frame_idx].code.insns.clone();
-        let insn = decode::decode(&insns, pc).ok_or_else(|| {
-            AndroidError::Vm(format!("decode failed at pc={pc}"))
-        })?;
+        let insn = decode::decode(&insns, pc)
+            .ok_or_else(|| AndroidError::Vm(format!("decode failed at pc={pc}")))?;
 
         self.steps += 1;
         self.execute(frame_idx, insn)?;
@@ -183,8 +180,7 @@ impl Vm {
                 let v = self.reg(frame_idx, insn.a)?.as_int();
                 if v == 0 {
                     let off = insn.b as i16 as i32;
-                    self.stack[frame_idx].pc =
-                        (pc_i32(self.stack[frame_idx].pc) + off) as usize;
+                    self.stack[frame_idx].pc = (pc_i32(self.stack[frame_idx].pc) + off) as usize;
                 } else {
                     self.stack[frame_idx].pc += insn.size;
                 }
@@ -193,13 +189,17 @@ impl Vm {
                 let v = self.reg(frame_idx, insn.a)?.as_int();
                 if v != 0 {
                     let off = insn.b as i16 as i32;
-                    self.stack[frame_idx].pc =
-                        (pc_i32(self.stack[frame_idx].pc) + off) as usize;
+                    self.stack[frame_idx].pc = (pc_i32(self.stack[frame_idx].pc) + off) as usize;
                 } else {
                     self.stack[frame_idx].pc += insn.size;
                 }
             }
-            opcodes::IF_EQ | opcodes::IF_NE | opcodes::IF_LT | opcodes::IF_GE | opcodes::IF_GT | opcodes::IF_LE => {
+            opcodes::IF_EQ
+            | opcodes::IF_NE
+            | opcodes::IF_LT
+            | opcodes::IF_GE
+            | opcodes::IF_GT
+            | opcodes::IF_LE => {
                 let a = self.reg(frame_idx, insn.a)?.as_int();
                 let b = self.reg(frame_idx, insn.b)?.as_int();
                 let take = match op {
@@ -213,8 +213,7 @@ impl Vm {
                 };
                 if take {
                     let off = insn.c as i16 as i32;
-                    self.stack[frame_idx].pc =
-                        (pc_i32(self.stack[frame_idx].pc) + off) as usize;
+                    self.stack[frame_idx].pc = (pc_i32(self.stack[frame_idx].pc) + off) as usize;
                 } else {
                     self.stack[frame_idx].pc += insn.size;
                 }
@@ -225,7 +224,7 @@ impl Vm {
             }
             opcodes::NEW_ARRAY => {
                 let len = self.reg(frame_idx, insn.b)?.as_int();
-                let arr = self.host.alloc_array(len);
+                let arr = self.host.alloc_array(len)?;
                 self.set_reg(frame_idx, insn.a, arr)?;
                 self.stack[frame_idx].pc += insn.size;
             }
@@ -273,10 +272,42 @@ impl Vm {
                 self.set_reg(frame_idx, insn.a, Value::Int(v))?;
                 self.stack[frame_idx].pc += insn.size;
             }
-            opcodes::IGET_OBJECT | opcodes::IPUT_OBJECT => {
-                // Minimal: treat as no-op store/load Int(0) for fixture apps.
-                if op == opcodes::IGET_OBJECT {
-                    self.set_reg(frame_idx, insn.a, Value::Obj(0))?;
+            opcodes::IGET
+            | opcodes::IGET_OBJECT
+            | opcodes::IGET_BOOLEAN
+            | opcodes::IGET_BYTE
+            | opcodes::IGET_CHAR
+            | opcodes::IGET_SHORT
+            | opcodes::IPUT
+            | opcodes::IPUT_OBJECT
+            | opcodes::IPUT_BOOLEAN
+            | opcodes::IPUT_BYTE
+            | opcodes::IPUT_CHAR
+            | opcodes::IPUT_SHORT => {
+                let objectish = matches!(op, opcodes::IGET_OBJECT | opcodes::IPUT_OBJECT);
+                let is_get = matches!(
+                    op,
+                    opcodes::IGET
+                        | opcodes::IGET_OBJECT
+                        | opcodes::IGET_BOOLEAN
+                        | opcodes::IGET_BYTE
+                        | opcodes::IGET_CHAR
+                        | opcodes::IGET_SHORT
+                );
+                if is_get {
+                    let obj = self.reg(frame_idx, insn.b)?;
+                    let v = self.host.instance_get(obj, insn.c).unwrap_or(if objectish {
+                        Value::Obj(0)
+                    } else {
+                        Value::Int(0)
+                    });
+                    self.set_reg(frame_idx, insn.a, v)?;
+                } else {
+                    let val = self.reg(frame_idx, insn.a)?;
+                    let obj = self.reg(frame_idx, insn.b)?;
+                    if !self.host.instance_put(obj, insn.c, val) {
+                        return Err(AndroidError::Vm("iput on null or non-instance".into()));
+                    }
                 }
                 self.stack[frame_idx].pc += insn.size;
             }

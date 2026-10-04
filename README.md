@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/status-active_development-brightgreen?style=for-the-badge" alt="Status: Active Development" />
   <img src="https://img.shields.io/badge/rust-wasm--bindgen-blue?style=for-the-badge&logo=rust" alt="Rust + Wasm" />
   <img src="https://img.shields.io/badge/vite-typescript-646CFF?style=for-the-badge&logo=vite" alt="Vite + TypeScript" />
-  <img src="https://img.shields.io/badge/tests-116_passing-brightgreen?style=for-the-badge" alt="116 Tests Passing" />
+  <img src="https://img.shields.io/badge/tests-153_passing-brightgreen?style=for-the-badge" alt="153 Tests Passing" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License" />
 </p>
 
@@ -13,17 +13,19 @@ Browser-native ARM emulator in Rust/WebAssembly, with a **constrained APK/DEX HL
 ## What works today
 
 - ARMv7-era CPU core (ARM + Thumb), pipeline-accurate PC reads
-- 116 unit tests (`cargo test --lib`)
+- 153 unit tests (`cargo test --lib`)
 - ROM / custom hex upload, UART, VRAM canvas, input, audio MMIO
 - VersatilePB subset: PL011 UART, SP804 timer, PL190 VIC + IRQ path
 - CP15 + short-descriptor MMU (section + coarse L2)
 - Linux ATAG boot helper + UI upload for zImage/initrd
-- **APK HLE:** parse APK/DEX, MVP Dalvik interpreter, stubbed Log/println, canvas text blit (`testdata/hello.apk`)
+- **APK HLE:** parse APK/DEX, MVP Dalvik interpreter, binary manifest launcher, constructors, instance fields, stubbed Log/println, canvas text blit (`testdata/hello.apk`)
 
 ## What does not work yet
 
-- Arbitrary Play Store APKs, multidex, JNI/native libs
+- Arbitrary Play Store APKs. There is no ART runtime and no Android framework, so a store APK does not run
+- Multidex, JNI/native libs, `resources.arsc`, and most Dalvik opcodes outside the MVP set
 - Full Android userspace (zygote, Binder fidelity, SurfaceFlinger)
+- `boot_android` does not boot Android. A kernel image is loaded like `boot_linux_kernel`. An APK, if passed, runs only on the HLE VM
 - Guaranteed goldfish kernel bring-up on every image
 
 See [docs/SUPPORTED_APKS.md](docs/SUPPORTED_APKS.md).
@@ -62,7 +64,7 @@ npm run build             # wasm-pack + TypeScript + Vite
 2. In the UI, **Load APK** → choose `testdata/hello.apk`
 3. **Run APK (HLE)** — check logcat panel and VRAM mode
 
-Regenerate fixtures: `cargo test --lib write_fixtures_to_testdata`
+Regenerate fixtures: `NEKODROID_WRITE_FIXTURES=1 cargo test --lib write_fixtures_to_testdata`
 
 ## Project layout
 

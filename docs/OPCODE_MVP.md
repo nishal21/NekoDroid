@@ -11,7 +11,7 @@ Implement these first (needed for `testdata/hello.apk`):
 - [x] `if-eq` / `if-ne` / `if-eqz` / `if-nez` / `if-lt`…`if-le` (0x32–0x39)
 - [x] `new-instance` (0x22)
 - [x] `invoke-virtual` `invoke-direct` `invoke-static` (0x6e–0x71)
-- [x] `iget` / `iput` object variants (0x52–0x5b subset)
+- [x] `iget` / `iput` (0x52, 0x59) and object/boolean/byte/char/short forms (0x54–0x58, 0x5b–0x5f). Values round-trip on the HLE instance. Wide forms are not implemented
 
 Session 55 additions:
 

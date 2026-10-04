@@ -56,3 +56,4 @@ handoff-devlog.md
 .cache/
 coverage/
 .wasm-pack/
+graphify-out/

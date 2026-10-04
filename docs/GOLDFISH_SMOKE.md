@@ -15,7 +15,8 @@ test-images/
 
 ## What the emulator does today
 
-- `boot_linux_kernel` / `boot_android` load the image into RAM and set ATAGs / machine id
+- `boot_linux_kernel` loads the image into RAM and sets ATAGs / machine id
+- `boot_android` does the same for a non-empty kernel. A non-empty APK is executed on the Dalvik HLE path and is not queued for a userspace launch that does not exist. Empty input returns failure. This is not an Android boot
 - MMC CMD17/CMD18 (+ CMD12 stop) can stream a mounted `system.img` sector buffer
 - Goldfish Pipe MMIO supports version probe, OPEN/CLOSE/POLL/WRITE/READ for `pipe:qemud:*` style names
 

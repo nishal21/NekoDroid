@@ -48,7 +48,10 @@ pub fn decode(insns: &[u16], pc: usize) -> Option<Insn> {
             insn.b = *insns.get(pc + 2)? as u32;
             insn.size = 3;
         }
-        opcodes::MOVE_RESULT | opcodes::MOVE_RESULT_OBJECT | opcodes::RETURN | opcodes::RETURN_OBJECT => {
+        opcodes::MOVE_RESULT
+        | opcodes::MOVE_RESULT_OBJECT
+        | opcodes::RETURN
+        | opcodes::RETURN_OBJECT => {
             insn.a = ((raw0 >> 8) & 0xff) as u32;
         }
         opcodes::CONST_4 => {
@@ -98,7 +101,12 @@ pub fn decode(insns: &[u16], pc: usize) -> Option<Insn> {
             insn.b = *insns.get(pc + 1)? as u16 as i16 as i32 as u32;
             insn.size = 2;
         }
-        opcodes::IF_EQ | opcodes::IF_NE | opcodes::IF_LT | opcodes::IF_GE | opcodes::IF_GT | opcodes::IF_LE => {
+        opcodes::IF_EQ
+        | opcodes::IF_NE
+        | opcodes::IF_LT
+        | opcodes::IF_GE
+        | opcodes::IF_GT
+        | opcodes::IF_LE => {
             insn.a = ((raw0 >> 8) & 0xf) as u32;
             insn.b = ((raw0 >> 12) & 0xf) as u32;
             insn.c = *insns.get(pc + 1)? as u16 as i16 as i32 as u32;
@@ -129,7 +137,18 @@ pub fn decode(insns: &[u16], pc: usize) -> Option<Insn> {
             insn.a = ((raw0 >> 8) & 0xf) as u32;
             insn.b = ((raw0 >> 12) & 0xf) as u32;
         }
-        opcodes::IGET_OBJECT | opcodes::IPUT_OBJECT => {
+        opcodes::IGET
+        | opcodes::IGET_OBJECT
+        | opcodes::IGET_BOOLEAN
+        | opcodes::IGET_BYTE
+        | opcodes::IGET_CHAR
+        | opcodes::IGET_SHORT
+        | opcodes::IPUT
+        | opcodes::IPUT_OBJECT
+        | opcodes::IPUT_BOOLEAN
+        | opcodes::IPUT_BYTE
+        | opcodes::IPUT_CHAR
+        | opcodes::IPUT_SHORT => {
             insn.a = ((raw0 >> 8) & 0xf) as u32;
             insn.b = ((raw0 >> 12) & 0xf) as u32;
             insn.c = *insns.get(pc + 1)? as u32;
