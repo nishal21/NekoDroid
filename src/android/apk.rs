@@ -97,3 +97,27 @@ fn descriptor_to_package(desc: &str) -> Option<String> {
     }
     Some(parts[..parts.len() - 1].join("."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::descriptor_to_package;
+
+    #[test]
+    fn descriptor_to_package_extracts_package_from_class() {
+        assert_eq!(
+            descriptor_to_package("Lcom/foo/Bar;"),
+            Some("com.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn descriptor_to_package_handles_class_without_package() {
+        assert_eq!(descriptor_to_package("LFoo;"), Some("Foo".to_string()));
+    }
+
+    #[test]
+    fn descriptor_to_package_rejects_missing_delimiters() {
+        assert_eq!(descriptor_to_package("com/foo/Bar;"), None);
+        assert_eq!(descriptor_to_package("Lcom/foo/Bar"), None);
+    }
+}

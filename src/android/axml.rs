@@ -60,3 +60,35 @@ fn scan_package_ascii(data: &[u8]) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_text_manifest;
+
+    #[test]
+    fn parse_text_manifest_with_package_and_activity() {
+        let manifest = b"package=com.example.app\nactivity=Lcom/example/MainActivity;\n";
+        assert_eq!(
+            parse_text_manifest(manifest).unwrap(),
+            (
+                "com.example.app".to_string(),
+                Some("Lcom/example/MainActivity;".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn parse_text_manifest_with_package_only() {
+        let manifest = b"package=com.example.app\n";
+        assert_eq!(
+            parse_text_manifest(manifest).unwrap(),
+            ("com.example.app".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn parse_text_manifest_without_package_returns_error() {
+        let manifest = b"activity=Lcom/example/MainActivity;\n";
+        assert!(parse_text_manifest(manifest).is_err());
+    }
+}
